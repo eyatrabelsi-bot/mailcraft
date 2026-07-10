@@ -18,8 +18,7 @@ async function callGemini(systemPrompt, messages) {
     systemInstruction: systemPrompt,
   });
 
-  // Gemini's chat history uses "model" instead of "assistant", and wraps
-  // text in a `parts` array — so we translate our simpler format into that.
+  // Gemini's chat history format is different from ours, so we need to convert it.
   const history = messages.slice(0, -1).map((m) => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }],
@@ -33,10 +32,7 @@ async function callGemini(systemPrompt, messages) {
   return result.response.text();
 }
 
-/**
- * Same as callGemini, but strips markdown fences and parses JSON.
- * Used by routes that need structured output (classify, match).
- */
+
 async function callGeminiForJSON(systemPrompt, messages) {
   const raw = await callGemini(systemPrompt, messages);
   const cleaned = raw.replace(/```json|```/g, '').trim();
