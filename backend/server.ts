@@ -571,12 +571,13 @@ DRAFTING & COMMUNICATION RULES:
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
+      root: path.join(process.cwd(), "frontend"),
       server: { middlewareMode: true },
       appType: "spa",
-    });
+});
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(process.cwd(), "frontend", "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
