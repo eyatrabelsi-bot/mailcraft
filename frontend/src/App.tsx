@@ -43,6 +43,7 @@ interface Email {
   urgency?: "Important" | "Medium" | "Faible";
   tag?: string;
   summary?: string;
+  gmailId?: string;   // ← add this line: stores the real Gmail message ID for replying
 }
 
 interface Baseline {
@@ -291,7 +292,7 @@ export default function App() {
   const [promptsLeft, setPromptsLeft] = useState<number>(25);
   const [showUpgradeModal, setShowUpgradeModal] = useState<boolean>(false);
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
-
+  
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   // Scroll to bottom when new messages are added or loaded
@@ -573,23 +574,37 @@ export default function App() {
   };
 
   // Simulate validating and saving a draft response to Gmail
-  const handleValidateDraft = (emailId: number, draftText: string) => {
+ const handleValidateDraft = async (emailId: number, draftText: string) => {
     const originalEmail = emails.find(e => e.id === emailId);
     if (!originalEmail) return;
 
+    if (connected && originalEmail.gmailId) {
+      try {
+        const res = await fetch("/api/gmail/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            to: originalEmail.from,
+            subject: `Re: ${originalEmail.subject}`,
+            body: draftText,
+            threadId: originalEmail.gmailId,
+          }),
+        });
+        if (!res.ok) throw new Error("Send failed");
+      } catch (err) {
+        showToast("Erreur : l'email n'a pas pu être envoyé.");
+        return;
+      }
+    }
+
     setSentEmails(prev => [
       ...prev,
-      {
-        id: Date.now(),
-        to: originalEmail.from,
-        subject: `Re: ${originalEmail.subject}`,
-        body: draftText,
-        date: "À l'instant"
-      }
+      { id: Date.now(), to: originalEmail.from, subject: `Re: ${originalEmail.subject}`, body: draftText, date: "À l'instant" }
     ]);
-
     setSentEmailIds(prev => [...prev, emailId]);
-
+    setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
+    showToast(connected ? "Email envoyé avec succès via Gmail !" : "Le brouillon a été validé et enregistré avec succès dans Gmail !");
+  };
     // Mark email as replied/read
     setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
     showToast("Le brouillon a été validé et enregistré avec succès dans Gmail !");
@@ -715,10 +730,7 @@ export default function App() {
         <div className="flex items-center gap-4">
           {!connected ? (
             <button
-              onClick={() => {
-                setConnected(true);
-                showToast("Compte Google connecté avec succès ! Les chats sont maintenant sauvegardés dans l'historique.");
-              }}
+              onClick={handleConnectGoogle}
               className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-4.5 py-2 rounded-xl transition-all shadow-md shadow-indigo-600/10 flex items-center gap-2 cursor-pointer"
             >
               <Plus size={15} /> Connecter avec Google
@@ -842,10 +854,7 @@ export default function App() {
             <div className="p-4 border-t border-slate-800 bg-slate-950/40">
               {!connected ? (
                 <button
-                  onClick={() => {
-                    setConnected(true);
-                    showToast("Compte Google connecté avec succès !");
-                  }}
+                  onClick={handleConnectGoogle}
                   className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] py-2.5 px-3 rounded-xl shadow-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer border border-indigo-400/10 animate-pulse"
                 >
                   <Plus size={12} /> Connecter avec Google
@@ -1003,10 +1012,7 @@ export default function App() {
                     </div>
                   </div>
                   <button
-                    onClick={() => {
-                      setConnected(true);
-                      showToast("Compte Google connecté avec succès !");
-                    }}
+                    onClick={handleConnectGoogle}
                     className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-semibold text-xs py-3 px-5 rounded-xl shadow-lg shadow-indigo-600/10 hover:shadow-indigo-600/20 transition-all flex items-center justify-center gap-2 cursor-pointer border border-indigo-400/20 shrink-0"
                   >
                     <Plus size={15} /> Connecter avec Google
@@ -1129,10 +1135,7 @@ export default function App() {
                     L'affichage de votre boîte de réception Gmail et le triage automatique MailCraft IA requièrent la connexion de votre compte.
                   </p>
                   <button
-                    onClick={() => {
-                      setConnected(true);
-                      showToast("Compte Google connecté avec succès !");
-                    }}
+                    onClick={handleConnectGoogle}
                     className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs py-3 px-6 rounded-xl shadow-lg transition-all flex items-center gap-2 cursor-pointer animate-pulse"
                   >
                     <Plus size={14} /> Connecter avec Google
@@ -2600,11 +2603,7 @@ La Direction`,
               </div>
 
               <button
-                onClick={() => {
-                  setConnected(true);
-                  setShowUpgradeModal(false);
-                  showToast("Compte Google connecté avec succès ! Mode illimité activé.");
-                }}
+                onClick={handleConnectGoogle}
                 className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs py-3.5 px-6 rounded-xl shadow-lg hover:shadow-indigo-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer animate-pulse"
               >
                 <Plus size={15} /> Connecter avec Google Gmail
