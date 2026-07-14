@@ -3,11 +3,44 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
+import session from "express-session";
+import { google } from "googleapis";
 
 const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "10mb" }));
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "mailcraft-dev-secret-change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }, // 1 day, secure:false for localhost (http)
+  })
+);
+
+declare module "express-session" {
+  interface SessionData {
+    tokens?: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+    };
+  }
+}
+
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+const GMAIL_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/userinfo.email",
+];
 
 // Initialize the Google GenAI SDK.
 const apiKey = process.env.GEMINI_API_KEY;
