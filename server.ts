@@ -1,0 +1,591 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import "dotenv/config";
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json({ limit: "10mb" }));
+
+// Initialize the Google GenAI SDK.
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) {
+  console.warn("Warning: GEMINI_API_KEY is not defined. AI features will run in fallback mode.");
+}
+
+const ai = new GoogleGenAI({
+  apiKey: apiKey || "",
+  httpOptions: {
+    headers: {
+      "User-Agent": "aistudio-build",
+    },
+  },
+});
+
+// ================= FALLBACK MECHANISMS =================
+// These smart, rule-based fallback functions ensure that if the Gemini API key
+// is rate-limited (429 quota exhausted) or missing, the application remains fully functional.
+
+function fallbackTriage(body: string) {
+  const content = body.toLowerCase();
+  
+  // Urgency logic
+  let urgency = "Medium";
+  const urgentKeywords = [
+    "urgente", "urgent", "immédiat", "rapidement", "important", "deadline", 
+    "date limite", "prioritaire", "critical", "attention", "asap"
+  ];
+  const lowKeywords = [
+    "newsletter", "pub", "promo", "low priority", "archive", "faible", 
+    "loisir", "invitation"
+  ];
+  
+  if (urgentKeywords.some(kw => content.includes(kw))) {
+    urgency = "Important";
+  } else if (lowKeywords.some(kw => content.includes(kw))) {
+    urgency = "Faible";
+  }
+
+  // Tag logic
+  let tag = "Email";
+  if (["recrutement", "candidature", "cv", "job", "offre", "embauche", "poste", "work"].some(kw => content.includes(kw))) {
+    tag = "Job";
+  } else if (["stage", "stagiaire", "internship", "intern"].some(kw => content.includes(kw))) {
+    tag = "Stage";
+  } else if (["cours", "étude", "université", "fac", "recherche", "examen", "school", "university", "academic", "etudiant"].some(kw => content.includes(kw))) {
+    tag = "Study";
+  } else if (["réunion", "rdv", "rendez-vous", "meeting", "call", "entretien", "visio", "schedule"].some(kw => content.includes(kw))) {
+    tag = "Meeting";
+  }
+
+  return { urgency, tag };
+}
+
+function fallbackSummary(body: string): string {
+  const cleanBody = body.replace(/[\r\n]+/g, " ").trim();
+  if (cleanBody.length <= 80) {
+    return cleanBody;
+  }
+  
+  // Try to find first punctuation
+  const firstSentenceIndex = cleanBody.match(/[.!?]/)?.index;
+  if (firstSentenceIndex && firstSentenceIndex > 15 && firstSentenceIndex < 100) {
+    return cleanBody.substring(0, firstSentenceIndex + 1);
+  }
+  
+  // Truncate cleanly to first 12-14 words
+  const words = cleanBody.split(/\s+/);
+  if (words.length <= 14) {
+    return cleanBody;
+  }
+  return words.slice(0, 13).join(" ") + "...";
+}
+
+function fallbackExtractCriteria(fileText: string): string {
+  const cleanText = fileText.replace(/[\r\n]+/g, " ").trim();
+  
+  const lowerText = cleanText.toLowerCase();
+  const searchKeywords = ["recherche", "requis", "compétences", "exigences", "profil", "requirements", "skills", "criteria"];
+  
+  for (const kw of searchKeywords) {
+    const idx = lowerText.indexOf(kw);
+    if (idx !== -1) {
+      const snippet = cleanText.substring(Math.max(0, idx - 20), Math.min(cleanText.length, idx + 160));
+      return `Profil recherché incluant : ${snippet.trim()}...`;
+    }
+  }
+  
+  if (cleanText.length <= 150) {
+    return cleanText;
+  }
+  return cleanText.substring(0, 150) + "...";
+}
+
+interface EvaluatedEmail {
+  id: number;
+  from: string;
+  subject: string;
+  body: string;
+}
+
+function fallbackMatchEmails(topic: string, criteria: string, emails: EvaluatedEmail[]) {
+  const cleanTopic = topic.toLowerCase();
+  const cleanCriteria = criteria.toLowerCase();
+
+  const results = emails.map(email => {
+    const bodyLower = email.body.toLowerCase();
+    const subjectLower = email.subject.toLowerCase();
+    const combinedText = `${subjectLower} ${bodyLower}`;
+
+    // Topic match checks
+    const topicKeywords = cleanTopic.split(/\s+/).filter(w => w.length > 2);
+    let matchedTopic = false;
+    
+    if (topicKeywords.length > 0) {
+      matchedTopic = topicKeywords.some(kw => combinedText.includes(kw));
+    } else {
+      matchedTopic = combinedText.includes(cleanTopic);
+    }
+
+    if (subjectLower.includes(cleanTopic) || cleanTopic.split(/\s+/).some(kw => kw.length > 3 && subjectLower.includes(kw))) {
+      matchedTopic = true;
+    }
+
+    // Criteria match checks
+    let match: "perfect" | "partial" | "none" = "none";
+    let reasoning = "";
+    let draft = "";
+
+    const isEnglish = /hello|dear|thank|meeting|job|regards|apply/i.test(combinedText);
+
+    if (matchedTopic) {
+      const criteriaKeywords = cleanCriteria.split(/\s+/).filter(w => w.length > 3);
+      let matchCount = 0;
+      
+      if (criteriaKeywords.length > 0) {
+        criteriaKeywords.forEach(kw => {
+          if (combinedText.includes(kw)) {
+            matchCount++;
+          }
+        });
+      }
+
+      if (matchCount >= Math.min(2, criteriaKeywords.length) || combinedText.includes(cleanCriteria)) {
+        match = "perfect";
+        reasoning = isEnglish 
+          ? "The email perfectly aligns with the required topic and meets all criteria."
+          : "L'email correspond parfaitement au sujet et répond à tous les critères définis.";
+      } else {
+        match = "partial";
+        reasoning = isEnglish
+          ? "The email matches the topic but is missing some specific criteria elements."
+          : "L'email correspond au sujet demandé mais certains critères spécifiques manquent.";
+      }
+    } else {
+      match = "none";
+      reasoning = isEnglish
+        ? "The email does not seem to relate to the active topic."
+        : "L'email ne semble pas être lié au sujet actif.";
+    }
+
+    // Draft reply template
+    if (isEnglish) {
+      if (match === "perfect") {
+        draft = `Hello,\n\nThank you for your message regarding "${topic}".\n\nYour profile matches our requirements perfectly. We would be delighted to discuss this further with you. Please let us know your availability for a brief call next week.\n\nBest regards,\nThe MailCraft AI Team`;
+      } else {
+        draft = `Hello,\n\nThank you for your interest and your message regarding "${topic}".\n\nWe have received your application/information. Our team is currently reviewing your message and we will get back to you if we need any additional details.\n\nBest regards,\nThe MailCraft AI Team`;
+      }
+    } else {
+      if (match === "perfect") {
+        draft = `Bonjour,\n\nMerci pour votre message concernant "${topic}".\n\nVotre profil correspond parfaitement à nos critères. Nous serions ravis d'échanger plus en détail avec vous. Pourriez-vous nous indiquer vos disponibilités pour un court entretien la semaine prochaine ?\n\nCordialement,\nL'équipe MailCraft AI`;
+      } else {
+        draft = `Bonjour,\n\nNous vous remercions de votre intérêt et de votre message concernant "${topic}".\n\nNous avons bien reçu vos informations. Notre équipe étudie actuellement votre message et nous reviendrons vers vous si des précisions sont nécessaires.\n\nCordialement,\nL'équipe MailCraft AI`;
+      }
+    }
+
+    return {
+      emailId: email.id,
+      matchedTopic,
+      match,
+      reasoning,
+      draft
+    };
+  });
+
+  return { results };
+}
+
+function fallbackChat(messages: { role: string; content: string }[]): string {
+  const lastMsg = messages[messages.length - 1]?.content || "";
+  const lastMsgLower = lastMsg.toLowerCase().trim();
+
+  // 1. Check for normal acknowledgements/short confirmations like "thank u", "thanks", "merci", etc.
+  const shortAcks = ["thank u", "thank you", "thanks", "merci", "ok", "okay", "d'accord", "cool", "super", "génial", "awesome", "perfect", "parfait", "done"];
+  const isShortAck = shortAcks.some(ack => lastMsgLower === ack || lastMsgLower.startsWith(ack + " ") || lastMsgLower.endsWith(" " + ack) || lastMsgLower === ack + "!" || lastMsgLower === ack + ".");
+
+  if (isShortAck) {
+    return "De rien ! Je reste toujours disponible à vos côtés dès que vous en avez besoin. / You are welcome! I am always available to assist you whenever you need.";
+  }
+
+  const generalQuestions = ["bonjour", "salut", "hello", "hi", "qui es-tu", "comment ça va", "how are you", "what is your name", "aide", "help"];
+  const isGeneralGreeting = generalQuestions.some(g => lastMsgLower.startsWith(g) || lastMsgLower === g);
+
+  if (isGeneralGreeting) {
+    return "Bonjour ! Je suis MailCraft AI, votre assistant intelligent de rédaction, d'analyse et d'accompagnement. Comment puis-je vous aider aujourd'hui ? Que ce soit pour rédiger un email, analyser un profil, traduire un texte ou répondre à toute autre question, je suis là pour vous aider avec flexibilité !";
+  }
+
+  // 2. Check for unsafe / out of domain requests
+  const isOutOfDomain = /hack|pirater|crack|malware|virus|voler|cheat|steal|kill|tuer|bombe|bomb|drogue|illegal|illégal|arme|weapon/i.test(lastMsgLower);
+
+  if (isOutOfDomain) {
+    return "Sorry, I am not designed to reply to this kind of request. / Désolé, je ne suis pas conçu pour répondre à ce type de demande.";
+  }
+
+  const isCanHelpQuery = /can (you|u) help me with|aide-moi avec|peux-tu m'aider avec|pouvez-vous m'aider avec/i.test(lastMsgLower);
+  const introPrefix = isCanHelpQuery ? "Yes, I can help you do that!\n\n" : "";
+
+  // 1. "How can you help me" / Abilities query
+  if (/how can you help|how can u help|what can you do|what can u do|comment peux-tu m'aider|comment m'aider|vos capacités|capabilities/i.test(lastMsgLower)) {
+    return `${introPrefix}En tant qu'assistant intelligent polyvalent de MailCraft AI, je dispose de nombreuses compétences pour faciliter votre quotidien :
+
+1. 📧 **Gestion & Rédaction d'E-mails** : 
+   - Rédaction de brouillons d'e-mails professionnels, personnels ou académiques à partir de simples consignes.
+   - Reformulation, correction de style, orthographe et changement de ton (formel, amical, persuasif).
+   - Traduction fluide de vos messages entre plusieurs langues (Français, Anglais, Espagnol, etc.).
+
+2. ✉️ **Réponses intelligentes aux invitations** : 
+   - Génération instantanée d'options adaptées pour accepter chaleureusement, décliner avec tact ou proposer des modifications de calendrier.
+
+3. 📂 **Triage intelligent & Catégorisation** :
+   - Analyse automatique de l'urgence et de l'importance de vos e-mails entrants.
+   - Classement automatique en arrière-plan pour que vous ne manquiez jamais une information cruciale.
+
+4. 🎯 **Mail Matching & Recrutement** :
+   - Scan automatique de vos e-mails entrants pour repérer les profils qui correspondent à vos critères (ex: recherche de stage, compétences spécifiques comme React ou CSS).
+   - Rédaction automatique de réponses adaptées aux candidats correspondants.
+
+5. 💡 **Assistance générale et flexible** :
+   - Je ne suis pas limité aux e-mails ! Je peux vous aider à structurer vos idées, résumer de longs documents, répondre à des questions de culture générale, ou vous donner des conseils de productivité.
+
+Dites-moi simplement ce dont vous avez besoin, et je m'en occupe !`;
+  }
+
+  // 2. "Invitation reply" query
+  if (/invitation|invite|invit|reply to|replay to|comment répondre|repondre/i.test(lastMsgLower)) {
+    return `${introPrefix}J'ai bien noté que vous avez reçu une invitation ! Pour y répondre de manière professionnelle et élégante, voici les 3 options les plus courantes que vous pouvez sélectionner et personnaliser :
+
+### Option 1 : Accepter chaleureusement et confirmer votre présence
+Idéal pour confirmer votre participation avec enthousiasme.
+\`\`\`
+Sujet : Confirmation de présence - [Nom de l'événement]
+
+Bonjour [Nom de l'interlocuteur],
+
+Je vous remercie chaleureusement pour cette invitation à [Nom de l'événement]. C'est avec grand plaisir que je vous confirme ma présence le [Date] à [Heure].
+
+Je me réjouis d'avance de participer à cet événement et d'échanger avec vous.
+
+Bien cordialement,
+[Votre Nom]
+\`\`\`
+
+### Option 2 : Décliner poliment avec tact (Empêchement)
+Idéal si vous ne pouvez pas assister, tout en maintenant une excellente relation.
+\`\`\`
+Sujet : Invitation - [Nom de l'événement]
+
+Bonjour [Nom de l'interlocuteur],
+
+Je vous remercie vivement pour votre aimable invitation à [Nom de l'événement].
+
+Malheureusement, j'ai déjà un engagement important de planifié à cette date et je ne pourrai pas me joindre à vous. Je le regrette sincèrement et j'espère que nous aurons l'occasion de nous croiser très bientôt lors d'un prochain événement.
+
+Je vous souhaite une excellente rencontre.
+
+Bien cordialement,
+[Votre Nom]
+\`\`\`
+
+### Option 3 : Demander un report ou proposer un autre créneau
+Idéal si le sujet vous intéresse mais que le créneau proposé ne vous convient pas.
+\`\`\`
+Sujet : Proposition de créneau alternatif - [Nom de l'événement]
+
+Bonjour [Nom de l'interlocuteur],
+
+Merci beaucoup pour votre invitation à échanger lors de [Nom de l'événement / Réunion].
+
+Le créneau proposé ne me convient malheureusement pas en raison d'un conflit d'agenda. Serait-il possible de reporter notre échange à l'une des dates suivantes ?
+- [Option date 1, ex: Mardi matin]
+- [Option date 2, ex: Jeudi après-midi]
+
+Je reste à votre entière disposition pour caler ce moment.
+
+Bien cordialement,
+[Votre Nom]
+\`\`\`
+
+Quelle option correspond le mieux à votre situation ? Je peux adapter le ton si vous le souhaitez !`;
+  }
+
+  if (/rédige|ecris|écris|write|draft/i.test(lastMsgLower)) {
+    return `${introPrefix}Voici une proposition basée sur votre demande :
+
+Bonjour,
+
+Je fais suite à votre sollicitation et me tiens à votre entière disposition.
+
+[Insérer les détails de votre demande ou personnaliser ce paragraphe]
+
+N'hésitez pas à me faire part de vos commentaires pour ajuster le contenu.
+
+Cordialement,
+[Votre Nom]`;
+  }
+
+  if (/lettre de motivation|motivation letter|cover letter/i.test(lastMsgLower)) {
+    return `${introPrefix}Voici un modèle de lettre de motivation que vous pouvez personnaliser :
+
+[Votre Nom]
+[Votre Adresse]
+[Téléphone] | [Email]
+
+À l'attention du Responsable du Recrutement
+
+Sujet : Candidature pour le poste souhaité
+
+Madame, Monsieur,
+
+C'est avec une grande motivation que je vous adresse ma candidature pour rejoindre vos équipes.
+
+De par mes expériences passées et mes compétences en résolution de problèmes, je suis convaincu(e) de pouvoir apporter une contribution positive et immédiate.
+
+Adaptable, rigoureux(se) et doté(e) d'un excellent esprit d'équipe, je serais ravi(e) de vous exposer mes motivations de vive voix lors d'un entretien.
+
+Dans l'attente de votre retour, je vous prie d'agréer, Madame, Monsieur, l'expression de mes salutations distinguées.
+
+[Votre Nom]`;
+  }
+
+  if (/cv|resume/i.test(lastMsgLower)) {
+    return `${introPrefix}Pour optimiser la structure de votre CV, voici mes recommandations principales :
+
+1. **Titre de profil accrocheur** : Indiquez clairement votre poste cible sous votre nom (ex: "Développeur Full-Stack - React/Node").
+2. **Expériences orientées résultats** : Utilisez des verbes d'action au début de chaque puce (ex: "Optimisé", "Conçu", "Négocié") et ajoutez des chiffres précis (ex: "croissance de 20%", "équipe de 5 personnes").
+3. **Mise en valeur des compétences clés** : Séparez vos compétences techniques (Hard Skills) de vos compétences humaines (Soft Skills).
+4. **Design sobre** : Privilégiez une mise en page aérée de 1 page, avec des marges équilibrées et une police très lisible (comme Inter).`;
+  }
+
+  // General flexible response fallback
+  return `${introPrefix}J'ai bien reçu votre demande : "${lastMsg}". En tant qu'assistant polyvalent, je peux vous aider à formuler vos réponses, reformuler vos textes, organiser vos idées ou répondre à vos questions. Dites-moi comment vous souhaitez que nous procédions ou si vous souhaitez adapter ce contenu !`;
+}
+
+
+// ================= ENDPOINTS =================
+
+// 1. Classification (Triage) Endpoint
+app.post("/api/triage", async (req, res) => {
+  const { body } = req.body;
+  if (!body) {
+    return res.status(400).json({ error: "Email body is required" });
+  }
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: `Classify the following email body:\n\n"${body}"`,
+      config: {
+        systemInstruction: "You are a professional email classifier. You must categorize emails according to urgency and core topic.",
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            urgency: {
+              type: Type.STRING,
+              description: "Urgency level of the email: must be 'Important', 'Medium', or 'Faible'",
+            },
+            tag: {
+              type: Type.STRING,
+              description: "A single word summarizing the topic, such as: 'Job', 'Study', 'Meeting', 'Stage', or another single relevant word.",
+            },
+          },
+          required: ["urgency", "tag"],
+        },
+      },
+    });
+
+    const resultText = response.text || "{}";
+    const classification = JSON.parse(resultText);
+    res.json(classification);
+  } catch (error: any) {
+    console.log("[AI] Triage endpoint: Using local fallback classification.");
+    const result = fallbackTriage(body);
+    res.json(result);
+  }
+});
+
+// 2. Summary Endpoint
+app.post("/api/summary", async (req, res) => {
+  const { body } = req.body;
+  if (!body) {
+    return res.status(400).json({ error: "Email body is required" });
+  }
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: `Summarize the following email in a single, short sentence under 20 words, suitable for a mobile notification. Do not write any introduction, quotes, or markdown. Return only the summary text.\n\nEmail body:\n"${body}"`,
+    });
+
+    res.json({ summary: response.text?.trim() || fallbackSummary(body) });
+  } catch (error: any) {
+    console.log("[AI] Summary endpoint: Using local fallback summary.");
+    res.json({ summary: fallbackSummary(body) });
+  }
+});
+
+// 3. Criteria Extraction Endpoint
+app.post("/api/extract-criteria", async (req, res) => {
+  const { fileText } = req.body;
+  if (!fileText) {
+    return res.status(400).json({ error: "File content is required" });
+  }
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: `Read the following text extracted from a document (like a CV, job offer, or criteria sheet) and summarize the core requirements into a concise baseline description of 1 to 3 sentences suitable for checking candidate emails against. Return only the extracted description, without any preambles, formatting, or markdown.\n\nDocument text:\n"${fileText}"`,
+    });
+
+    res.json({ criteria: response.text?.trim() || fallbackExtractCriteria(fileText) });
+  } catch (error: any) {
+    console.log("[AI] Criteria extraction endpoint: Using local fallback extraction.");
+    res.json({ criteria: fallbackExtractCriteria(fileText) });
+  }
+});
+
+// 4. Mail Matching Endpoint
+app.post("/api/match-emails", async (req, res) => {
+  const { topic, criteria, emails } = req.body;
+  if (!topic || !criteria || !emails || !Array.isArray(emails)) {
+    return res.status(400).json({ error: "topic, criteria, and emails array are required" });
+  }
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const prompt = `You are scanning an inbox for emails related to the topic: "${topic}".
+For any email that matches this topic, you must evaluate if its content satisfies the baseline criteria:
+"${criteria}"
+
+Here is the list of emails to evaluate:
+${JSON.stringify(emails)}
+
+For each email, evaluate:
+1. Does it match the topic? (matchedTopic)
+2. If it matches the topic, does it satisfy the baseline criteria? ("perfect", "partial", or "none")
+3. Provide a brief 1-sentence reasoning.
+4. Draft a response. If the match is "perfect", draft an enthusiastic, highly professional acceptance/approval reply confirming they meet the criteria and detailing next steps. If the match is "partial" or "none", draft a polite acknowledgement of receipt (accusé de réception) stating their application/message has been received and is being processed, without confirming approval. Match the language of the original email (French or English).
+
+Return a JSON object containing an array of evaluations.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            results: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  emailId: { type: Type.INTEGER, description: "The ID of the evaluated email" },
+                  matchedTopic: { type: Type.BOOLEAN, description: "True if the email matches the topic" },
+                  match: { type: Type.STRING, description: "Must be 'perfect', 'partial', or 'none'" },
+                  reasoning: { type: Type.STRING, description: "A short 1-sentence reasoning for the match level" },
+                  draft: { type: Type.STRING, description: "The drafted reply in the appropriate language (French or English)" },
+                },
+                required: ["emailId", "matchedTopic", "match", "reasoning", "draft"],
+              },
+            },
+          },
+          required: ["results"],
+        },
+      },
+    });
+
+    const resultText = response.text || '{"results":[]}';
+    res.json(JSON.parse(resultText));
+  } catch (error: any) {
+    console.log("[AI] Mail matching endpoint: Using local fallback matching.");
+    const fallbackResults = fallbackMatchEmails(topic, criteria, emails);
+    res.json(fallbackResults);
+  }
+});
+
+// 5. Chat Assistant Endpoint
+app.post("/api/chat", async (req, res) => {
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "messages array is required" });
+  }
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const systemInstruction = `You are MailCraft AI, a highly specialized, professional, and flexible AI assistant.
+Your primary expertise is writing, reviewing, critiquing, and drafting professional emails, letters of motivation, cover letters, job applications, academic inquiries, and workplace correspondence.
+However, you are extremely flexible! You can help the user with any other request they have (such as explaining general topics, translating, drafting other text, giving creative suggestions, answering random questions, etc.).
+
+STRICT BEHAVIOR AND FLEXIBILITY RULES:
+1. Short Acknowledgements / Confirmation:
+   - If the user says something simple/short like "thank u", "thanks", "merci", "ok", "merci beaucoup", "cool", "super", etc., you MUST reply with a simple, polite response stating that you are always available to help (e.g., "De rien ! Je reste toujours disponible à vos côtés." or "You're welcome! I am always available to help you.").
+
+2. Assistance Requests & Domain Checks:
+   - When the user asks "can you help me with [topic]" or makes a request, analyze whether it is in your domain of assistance (writing, emails, templates, translations, productivity, general helpful information, coding, etc. - basically anything that is safe and helpful).
+   - If it is in your domain, you MUST start your response with: "Yes, I can help you do that!" (or French equivalent: "Oui, je peux tout à fait vous aider à faire cela !") followed by the detailed solution/response.
+   - If the request is completely outside your capabilities or unsafe (such as hacking, malware, illegal activities, physical harm, etc.), you MUST respond with: "Sorry, I am not designed to reply to this kind of request." (or French equivalent: "Désolé, je ne suis pas conçu pour répondre à ce type de demande.").
+
+DRAFTING & COMMUNICATION RULES:
+- Match the language of the user (French or English).
+- Adopt flawless, polished, and polite communication etiquette.
+- Keep answers clear, comprehensive, and highly actionable.`;
+
+    const contents = messages.map((m: any) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    }));
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: contents,
+      config: {
+        systemInstruction,
+      },
+    });
+
+    res.json({ reply: response.text || fallbackChat(messages) });
+  } catch (error: any) {
+    console.log("[AI] Chat endpoint: Using local fallback assistant chatbot.");
+    res.json({ reply: fallbackChat(messages) });
+  }
+});
+
+// Vite server integration
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();

@@ -1,0 +1,6 @@
+{
+  "name": "MailCraft AI",
+  "description": "Assistant de messagerie IA et extension Gmail pour trier, résumer et répondre automatiquement à vos emails selon vos critères personnalisés.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
