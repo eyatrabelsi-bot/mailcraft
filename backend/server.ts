@@ -41,6 +41,171 @@ const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
+// ================= GOOGLE OAUTH ROUTES =================
+
+// 1. Kick off login — redirects user to Google's consent screen
+app.get("/api/auth/google", (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline", // needed to get a refresh_token
+    prompt: "consent",      // forces refresh_token on every login (good for dev)
+    scope: GMAIL_SCOPES,
+  });
+  res.redirect(url);
+});
+
+// 2. Google redirects back here after user approves
+app.get("/api/auth/google/callback", async (req, res) => {
+  const code = req.query.code as string;
+  if (!code) {
+    return res.redirect("/?auth_error=missing_code");
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    req.session.tokens = {
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expiry_date: tokens.expiry_date,
+    };
+    // Redirect back to the frontend app, logged in
+    res.redirect("/?auth_success=true");
+  } catch (error) {
+    console.error("OAuth callback error:", error);
+    res.redirect("/?auth_error=token_exchange_failed");
+  }
+});
+
+// 3. Frontend calls this to check "am I logged in?"
+app.get("/api/auth/status", async (req, res) => {
+  if (!req.session.tokens?.access_token) {
+    return res.json({ connected: false });
+  }
+
+  try {
+    oauth2Client.setCredentials(req.session.tokens);
+    const oauth2 = google.oauth2({ auth: oauth2Client, version: "v2" });
+    const { data } = await oauth2.userinfo.get();
+    res.json({ connected: true, email: data.email, name: data.name });
+  } catch (error) {
+    res.json({ connected: false });
+  }
+});
+// Helper: get an authenticated Gmail client for the current session
+function getGmailClient(req: express.Request) {
+  if (!req.session.tokens?.access_token) return null;
+  oauth2Client.setCredentials(req.session.tokens);
+  return google.gmail({ version: "v1", auth: oauth2Client });
+}
+
+// 5. Fetch real inbox emails
+app.get("/api/gmail/inbox", async (req, res) => {
+  const gmail = getGmailClient(req);
+  if (!gmail) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  try {
+    const list = await gmail.users.messages.list({
+      userId: "me",
+      maxResults: 15,
+      labelIds: ["INBOX"],
+    });
+
+    const messages = list.data.messages || [];
+
+    const emails = await Promise.all(
+      messages.map(async (msg) => {
+        const full = await gmail.users.messages.get({
+          userId: "me",
+          id: msg.id!,
+          format: "full",
+        });
+
+        const headers = full.data.payload?.headers || [];
+        const getHeader = (name: string) =>
+          headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+
+        // Extract plain text body (simplified — Gmail bodies can be multi-part)
+        let body = "";
+        const extractBody = (part: any): string => {
+          if (part.mimeType === "text/plain" && part.body?.data) {
+            return Buffer.from(part.body.data, "base64").toString("utf-8");
+          }
+          if (part.parts) {
+            for (const p of part.parts) {
+              const result = extractBody(p);
+              if (result) return result;
+            }
+          }
+          return "";
+        };
+        if (full.data.payload) body = extractBody(full.data.payload);
+
+        return {
+          id: msg.id,
+          from: getHeader("From"),
+          subject: getHeader("Subject"),
+          date: getHeader("Date"),
+          body: body || "(No plain text content)",
+          read: !full.data.labelIds?.includes("UNREAD"),
+        };
+      })
+    );
+
+    res.json({ emails });
+  } catch (error: any) {
+    console.error("Gmail inbox fetch error:", error.message);
+    res.status(500).json({ error: "Failed to fetch inbox" });
+  }
+});
+
+// 6. Send a real email reply
+app.post("/api/gmail/send", async (req, res) => {
+  const gmail = getGmailClient(req);
+  if (!gmail) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  const { to, subject, body, threadId } = req.body;
+  if (!to || !subject || !body) {
+    return res.status(400).json({ error: "to, subject, and body are required" });
+  }
+
+  try {
+    const message = [
+      `To: ${to}`,
+      `Subject: ${subject}`,
+      `Content-Type: text/plain; charset="UTF-8"`,
+      "",
+      body,
+    ].join("\n");
+
+    const encodedMessage = Buffer.from(message)
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+
+    await gmail.users.messages.send({
+      userId: "me",
+      requestBody: {
+        raw: encodedMessage,
+        threadId: threadId || undefined,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Gmail send error:", error.message);
+    res.status(500).json({ error: "Failed to send email" });
+  }
+});
+// 4. Logout
+app.post("/api/auth/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.json({ success: true });
+  });
+});
 
 // Initialize the Google GenAI SDK.
 const apiKey = process.env.GEMINI_API_KEY;
