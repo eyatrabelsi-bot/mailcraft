@@ -43,7 +43,7 @@ interface Email {
   urgency?: "Important" | "Medium" | "Faible";
   tag?: string;
   summary?: string;
-  gmailId?: string;   // ← add this line: stores the real Gmail message ID for replying
+  gmailId?: string;   // stores the real Gmail message ID for replying
 }
 
 interface Baseline {
@@ -294,6 +294,51 @@ export default function App() {
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // ================= REAL GOOGLE OAUTH + GMAIL WIRING =================
+
+  const handleConnectGoogle = () => {
+    window.location.href = "/api/auth/google";
+  };
+
+  const fetchRealInbox = async () => {
+    try {
+      const res = await fetch("/api/gmail/inbox");
+      if (!res.ok) return;
+      const data = await res.json();
+      const realEmails: Email[] = (data.emails || []).map((e: any, idx: number) => ({
+        id: idx + 1,
+        gmailId: e.id,
+        from: e.from,
+        subject: e.subject,
+        body: e.body,
+        date: e.date,
+        read: e.read,
+      }));
+      setEmails(realEmails);
+    } catch (err) {
+      console.error("Failed to load real inbox:", err);
+    }
+  };
+
+  // On load: check if already logged in (or just redirected back from Google), then load real inbox
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const res = await fetch("/api/auth/status");
+        const data = await res.json();
+        if (data.connected) {
+          setConnected(true);
+          fetchRealInbox();
+          // Clean the ?auth_success=true param from the URL bar
+          window.history.replaceState({}, "", "/");
+        }
+      } catch (err) {
+        console.error("Auth status check failed:", err);
+      }
+    };
+    checkAuth();
+  }, []);
 
   // Scroll to bottom when new messages are added or loaded
   useEffect(() => {
@@ -573,8 +618,8 @@ export default function App() {
     }
   };
 
-  // Simulate validating and saving a draft response to Gmail
- const handleValidateDraft = async (emailId: number, draftText: string) => {
+  // Validate a draft: send it for real via Gmail if connected, otherwise simulate
+  const handleValidateDraft = async (emailId: number, draftText: string) => {
     const originalEmail = emails.find(e => e.id === emailId);
     if (!originalEmail) return;
 
@@ -604,10 +649,6 @@ export default function App() {
     setSentEmailIds(prev => [...prev, emailId]);
     setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
     showToast(connected ? "Email envoyé avec succès via Gmail !" : "Le brouillon a été validé et enregistré avec succès dans Gmail !");
-  };
-    // Mark email as replied/read
-    setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
-    showToast("Le brouillon a été validé et enregistré avec succès dans Gmail !");
   };
 
   // Manage UI feedback toasts
