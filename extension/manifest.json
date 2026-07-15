@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "MailCraft AI - Gmail Badges",
+  "version": "1.0.0",
+  "description": "Injects AI classification badges next to emails directly inside Gmail.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://your-backend.example.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://mail.google.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

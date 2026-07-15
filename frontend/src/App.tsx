@@ -269,11 +269,11 @@ export default function App() {
   const [baselines, setBaselines] = useState<Baseline[]>([
     {
       id: "bl-1",
-      title: "Critères Stage React 6 mois",
-      description: "Le candidat doit posséder une expérience de projets personnels réalisés en React et Tailwind CSS, et rechercher explicitement un stage de 6 mois.",
+      title: "Critères Baseline 1",
+      description: "",
       fileName: "",
       fileText: "",
-      topicQuery: "Candidature Stage de développeur React"
+      topicQuery: ""
     }
   ]);
   
