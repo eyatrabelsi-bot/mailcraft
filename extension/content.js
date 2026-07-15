@@ -13,14 +13,17 @@ const PROCESSED_ATTR = "data-mailcraft-processed";
 const ROW_SELECTOR = "tr.zA";
 const SENDER_SELECTOR = "[email]"; // sender spans carry an `email` attribute
 const SUBJECT_SELECTOR = ".bog"; // subject text span
+const SNIPPET_SELECTOR = ".y2"; // preview text Gmail shows after the subject
 // -----------------------------------------------------------------------
 
 function extractRowData(row) {
   const senderEl = row.querySelector(SENDER_SELECTOR);
   const subjectEl = row.querySelector(SUBJECT_SELECTOR);
+  const snippetEl = row.querySelector(SNIPPET_SELECTOR);
 
   const sender = senderEl?.getAttribute("email") || senderEl?.textContent?.trim() || "";
   const subject = subjectEl?.textContent?.trim() || "";
+  const snippet = snippetEl?.textContent?.trim() || "";
 
   // Gmail doesn't expose a clean, stable thread ID in the row markup across
   // all versions. Fall back to a composite key if a real ID isn't found.
@@ -29,7 +32,12 @@ function extractRowData(row) {
     row.id ||
     `${sender}::${subject}`;
 
-  return { threadId, sender, subject };
+  // /api/triage classifies a single `body` string — the list view only has
+  // subject + a truncated snippet, not the full email, but that's enough
+  // signal for urgency/tag classification.
+  const body = [subject, snippet].filter(Boolean).join("\n");
+
+  return { threadId, sender, subject, body };
 }
 
 function makeBadge(label) {
@@ -59,7 +67,7 @@ function classifyRow(row) {
   const badgeEl = injectLoadingBadge(row);
 
   chrome.runtime.sendMessage(
-    { type: "CLASSIFY_EMAIL", payload: data },
+    { type: "CLASSIFY_EMAIL", payload: { threadId: data.threadId, body: data.body } },
     (response) => {
       if (chrome.runtime.lastError) {
         badgeEl.remove();
@@ -69,9 +77,11 @@ function classifyRow(row) {
         badgeEl.remove();
         return;
       }
-      badgeEl.textContent = response.result.label || "?";
+      // /api/triage returns { urgency, tag }
+      const { urgency, tag } = response.result;
+      badgeEl.textContent = tag || urgency || "?";
       badgeEl.classList.remove("mailcraft-badge--loading");
-      badgeEl.classList.add(`mailcraft-badge--${(response.result.label || "default").toLowerCase()}`);
+      badgeEl.classList.add(`mailcraft-badge--${(urgency || "default").toLowerCase()}`);
     }
   );
 }

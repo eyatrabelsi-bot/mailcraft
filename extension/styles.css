@@ -22,17 +22,17 @@
   color: #80868b;
 }
 
-.mailcraft-badge--urgent {
+.mailcraft-badge--important {
   background: #fce8e6;
   color: #c5221f;
 }
 
-.mailcraft-badge--newsletter {
-  background: #e6f4ea;
-  color: #137333;
-}
-
-.mailcraft-badge--follow-up {
+.mailcraft-badge--medium {
   background: #fef7e0;
   color: #b06000;
+}
+
+.mailcraft-badge--faible {
+  background: #e6f4ea;
+  color: #137333;
 }

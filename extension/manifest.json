@@ -6,7 +6,7 @@
   "permissions": ["storage"],
   "host_permissions": [
     "https://mail.google.com/*",
-    "https://your-backend.example.com/*"
+    "http://localhost:3000/*"
   ],
   "background": {
     "service_worker": "background.js"
