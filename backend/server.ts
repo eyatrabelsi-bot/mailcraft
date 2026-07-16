@@ -581,7 +581,7 @@ app.post("/api/triage", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: `Classify the following email body:\n\n"${body}"`,
       config: {
         systemInstruction: "You are a professional email classifier. You must categorize emails according to urgency and core topic.",
@@ -607,6 +607,15 @@ app.post("/api/triage", async (req, res) => {
     const classification = JSON.parse(resultText);
     res.json(classification);
   } catch (error: any) {
+    // Log the REAL failure reason — status code, message, whatever the SDK
+    // gives us — instead of just announcing that fallback kicked in. This
+    // is the only way to tell "invalid/expired key" apart from "rate
+    // limited" apart from "malformed response that failed JSON.parse".
+    console.error("[AI] Triage endpoint error:", {
+      message: error?.message,
+      status: error?.status ?? error?.response?.status,
+      code: error?.code,
+    });
     console.log("[AI] Triage endpoint: Using local fallback classification.");
     const result = fallbackTriage(body);
     res.json(result);
@@ -625,14 +634,38 @@ app.post("/api/summary", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: `Summarize the following email in a single, short sentence under 20 words, suitable for a mobile notification. Do not write any introduction, quotes, or markdown. Return only the summary text.\n\nEmail body:\n"${body}"`,
     });
 
-    res.json({ summary: response.text?.trim() || fallbackSummary(body) });
+    const aiText = response.text?.trim();
+    // If the model call technically succeeded but returned nothing usable,
+    // this is STILL a fallback from the client's point of view — flag it
+    // as such rather than reporting source: "ai" for text that never
+    // actually came from the model.
+    res.json(
+      aiText
+        ? { summary: aiText, source: "ai" }
+        : { summary: fallbackSummary(body), source: "fallback", reason: "empty_ai_response" }
+    );
   } catch (error: any) {
+    console.error("[AI] Summary endpoint error:", {
+      message: error?.message,
+      status: error?.status ?? error?.response?.status,
+      code: error?.code,
+    });
     console.log("[AI] Summary endpoint: Using local fallback summary.");
-    res.json({ summary: fallbackSummary(body) });
+    // Surface WHY it's degraded (quota vs. missing key vs. something else)
+    // so the frontend can show an accurate, specific message instead of a
+    // generic "AI unavailable" — and so you can tell them apart at a
+    // glance without digging through server logs.
+    const reason =
+      error?.status === 429 || error?.response?.status === 429
+        ? "quota_exceeded"
+        : !apiKey
+        ? "missing_api_key"
+        : "ai_error";
+    res.json({ summary: fallbackSummary(body), source: "fallback", reason });
   }
 });
 
@@ -648,7 +681,7 @@ app.post("/api/extract-criteria", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: `Read the following text extracted from a document (like a CV, job offer, or criteria sheet) and summarize the core requirements into a concise baseline description of 1 to 3 sentences suitable for checking candidate emails against. Return only the extracted description, without any preambles, formatting, or markdown.\n\nDocument text:\n"${fileText}"`,
     });
 
@@ -686,7 +719,7 @@ For each email, evaluate:
 Return a JSON object containing an array of evaluations.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -757,7 +790,7 @@ DRAFTING & COMMUNICATION RULES:
     }));
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash-lite",
       contents: contents,
       config: {
         systemInstruction,

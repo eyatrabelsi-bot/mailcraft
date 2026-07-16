@@ -154,8 +154,78 @@ function scanForRows(root = document) {
   root.querySelectorAll(ROW_SELECTOR).forEach(classifyRow);
 }
 
-// Initial pass, in case rows are already present when the script loads.
+// --- Thread view: inject an AI summary above the real message body -------
+// div.a3s is Gmail's rendered message body once a thread/email is opened.
+// The full text is already sitting in the DOM at that point (Gmail fetched
+// it to display it), so we read it straight from there instead of hitting
+// the Gmail API again the way CLASSIFY_EMAIL does for the list view.
+const SUMMARY_BODY_SELECTOR = "div.a3s";
+const SUMMARY_PROCESSED_ATTR = "data-mailcraft-summary-processed";
+
+function getOpenThreadId() {
+  // While a thread is open, Gmail's URL hash looks like
+  // "#inbox/FMfcgzQXJkxxxxx" — the last segment is a stable id for the
+  // currently open thread. It won't always match the legacy numeric
+  // thread id used in the list view, but that's fine here: this id is
+  // only used as this feature's own cache key, not passed to the Gmail API.
+  const hash = location.hash || "";
+  const parts = hash.split("/");
+  return parts[parts.length - 1] || hash;
+}
+
+function makeSummaryBox() {
+  const box = document.createElement("div");
+  box.className = "mailcraft-summary-box mailcraft-summary-box--loading";
+  box.textContent = "✨ Génération du résumé...";
+  return box;
+}
+
+function summarizeOpenBody(bodyEl) {
+  if (bodyEl.hasAttribute(SUMMARY_PROCESSED_ATTR)) return;
+
+  const text = bodyEl.innerText?.trim();
+  if (!text) return;
+
+  bodyEl.setAttribute(SUMMARY_PROCESSED_ATTR, "true");
+
+  const threadId = getOpenThreadId();
+  const box = makeSummaryBox();
+  bodyEl.parentElement?.insertBefore(box, bodyEl);
+
+  try {
+    chrome.runtime.sendMessage(
+      { type: "SUMMARIZE_EMAIL", payload: { threadId, body: text } },
+      (response) => {
+        if (chrome.runtime.lastError || !response?.ok) {
+          // Let a later pass retry instead of leaving a permanently blank
+          // or stuck-loading box.
+          box.remove();
+          bodyEl.removeAttribute(SUMMARY_PROCESSED_ATTR);
+          return;
+        }
+
+        // /api/summary returns { summary }
+        box.textContent = `✨ ${response.result.summary}`;
+        box.classList.remove("mailcraft-summary-box--loading");
+      }
+    );
+  } catch (err) {
+    box.remove();
+    bodyEl.removeAttribute(SUMMARY_PROCESSED_ATTR);
+    if (err.message?.includes("Extension context invalidated")) {
+      handleStaleContext();
+    }
+  }
+}
+
+function scanForOpenBodies(root = document) {
+  root.querySelectorAll(SUMMARY_BODY_SELECTOR).forEach(summarizeOpenBody);
+}
+
+// Initial pass, in case rows/an already-open thread are present when the
+// script loads.
 scanForRows();
+scanForOpenBodies();
 
 // Gmail loads/re-renders rows continuously (scrolling, new mail, switching
 // views), so we watch the whole app container for added nodes.
@@ -174,6 +244,14 @@ const observer = new MutationObserver((mutations) => {
         const ancestorRow = node.closest?.(ROW_SELECTOR);
         if (ancestorRow) classifyRow(ancestorRow);
       }
+
+      // Thread view: catch a message body that IS the added node itself,
+      // not just one nested inside it.
+      if (node.matches?.(SUMMARY_BODY_SELECTOR)) {
+        summarizeOpenBody(node);
+      } else {
+        scanForOpenBodies(node);
+      }
     }
   }
 });
@@ -184,3 +262,11 @@ observer.observe(document.body, { childList: true, subtree: true });
 // unmarked but nothing guarantees a DOM mutation touches them again. Sweep
 // periodically to catch and retry those.
 const sweepIntervalId = setInterval(() => scanForRows(), 5000);
+
+// Gmail is a single-page app: switching from one open thread to another
+// changes location.hash without necessarily firing a childList mutation
+// on the body itself (React may just swap innerText/props in place). The
+// periodic sweep below re-checks in case the observer missed it, and this
+// hashchange listener catches it immediately for a snappier feel.
+window.addEventListener("hashchange", () => scanForOpenBodies());
+setInterval(() => scanForOpenBodies(), 3000);

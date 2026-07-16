@@ -160,3 +160,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Required: keep the message channel open for the async response above.
   return true;
 });
+
+// --- Summary endpoint (thread view, injected above the real body) --------
+// Same shape of problem as the classification cache above: this is still
+// the same service worker, so it gets unloaded/restarted just as
+// aggressively. Reusing the classification cache's key would collide
+// (different payload shape), so this gets its own storage key + Map.
+const SUMMARY_BACKEND_URL = "http://localhost:3000/api/summary";
+const SUMMARY_STORAGE_KEY = "mailcraft_summary_cache";
+const MAX_SUMMARY_CACHE_ENTRIES = 500;
+
+const summaryCache = new Map();
+let summaryCacheLoaded = false;
+let summaryCacheLoadPromise = null;
+
+function loadSummaryCacheFromStorage() {
+  if (summaryCacheLoadPromise) return summaryCacheLoadPromise;
+  summaryCacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([SUMMARY_STORAGE_KEY], (result) => {
+      const stored = result[SUMMARY_STORAGE_KEY] || {};
+      for (const [threadId, value] of Object.entries(stored)) {
+        summaryCache.set(threadId, value);
+      }
+      summaryCacheLoaded = true;
+      resolve();
+    });
+  });
+  return summaryCacheLoadPromise;
+}
+
+function persistSummaryCache() {
+  while (summaryCache.size > MAX_SUMMARY_CACHE_ENTRIES) {
+    const oldestKey = summaryCache.keys().next().value;
+    summaryCache.delete(oldestKey);
+  }
+  const asObject = Object.fromEntries(summaryCache);
+  chrome.storage.local.set({ [SUMMARY_STORAGE_KEY]: asObject });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type !== "SUMMARIZE_EMAIL") return false;
+
+  // content.js sends the FULL body text scraped directly from the open
+  // thread's rendered DOM (div.a3s) — Gmail has already fetched and
+  // rendered it at that point, so there's no need to hit the Gmail API
+  // again here the way CLASSIFY_EMAIL does for the list view.
+  const { threadId, body } = message.payload;
+
+  (async () => {
+    if (!summaryCacheLoaded) await loadSummaryCacheFromStorage();
+
+    if (summaryCache.has(threadId)) {
+      sendResponse({ ok: true, result: summaryCache.get(threadId) });
+      return;
+    }
+
+    try {
+      const res = await fetch(SUMMARY_BACKEND_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body }),
+      });
+      if (!res.ok) throw new Error(`Backend returned ${res.status}`);
+      const data = await res.json(); // Real shape from /api/summary: { summary }
+      summaryCache.set(threadId, data);
+      persistSummaryCache();
+      sendResponse({ ok: true, result: data });
+    } catch (err) {
+      sendResponse({ ok: false, error: err.message });
+    }
+  })();
+
+  // Required: keep the message channel open for the async response above.
+  return true;
+});

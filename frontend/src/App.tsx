@@ -43,6 +43,8 @@ interface Email {
   urgency?: "Important" | "Medium" | "Faible";
   tag?: string;
   summary?: string;
+  summarySource?: "ai" | "fallback"; // whether `summary` is real AI output or the degraded local fallback
+  summaryReason?: string; // e.g. "quota_exceeded", "missing_api_key" — only set when summarySource is "fallback"
   gmailId?: string;   // stores the real Gmail message ID for replying
   isAutoReply?: boolean; // true for synthetic entries representing a sent auto-reply
 }
@@ -62,6 +64,24 @@ interface MatchResult {
   match: "perfect" | "partial" | "none";
   reasoning: string;
   draft: string;
+}
+
+// Renders an email's summary text, but tells the truth when it's the
+// crude local fallback (quota exceeded, missing API key, network error)
+// rather than presenting a truncated body as if it were a real AI summary.
+function summaryLabel(email: Pick<Email, "summary" | "summarySource" | "summaryReason">, loadingText: string): string {
+  if (!email.summary) return loadingText;
+  if (email.summarySource !== "fallback") return email.summary;
+
+  const reasonText: Record<string, string> = {
+    quota_exceeded: "quota IA dépassé",
+    missing_api_key: "clé API manquante",
+    network_error: "serveur injoignable",
+    empty_ai_response: "réponse IA vide",
+    ai_error: "erreur IA",
+  };
+  const reason = email.summaryReason ? reasonText[email.summaryReason] || "IA indisponible" : "IA indisponible";
+  return `⚠️ Résumé indisponible (${reason}) — aperçu : ${email.summary}`;
 }
 
 const DEFAULT_EMAILS: Email[] = [
@@ -87,7 +107,8 @@ Thomas Legrand
     read: false,
     urgency: "Important",
     tag: "Stage",
-    summary: "Thomas Legrand postule pour un stage de 6 mois en React/Tailwind et dispose de projets personnels solides."
+    summary: "Thomas Legrand postule pour un stage de 6 mois en React/Tailwind et dispose de projets personnels solides.",
+    summarySource: "ai"
   },
   {
     id: 2,
@@ -107,7 +128,8 @@ Sorbonne Université`,
     read: false,
     urgency: "Important",
     tag: "Study",
-    summary: "Relevé de notes officiel du S5 manquant sous 48h sous peine de rejet définitif du dossier de Master 1."
+    summary: "Relevé de notes officiel du S5 manquant sous 48h sous peine de rejet définitif du dossier de Master 1.",
+    summarySource: "ai"
   },
   {
     id: 3,
@@ -127,7 +149,8 @@ Jean Dupont`,
     read: true,
     urgency: "Medium",
     tag: "Stage",
-    summary: "Jean Dupont recherche un stage de fin d'études de 6 mois en tant que Data Analyst."
+    summary: "Jean Dupont recherche un stage de fin d'études de 6 mois en tant que Data Analyst.",
+    summarySource: "ai"
   },
   {
     id: 4,
@@ -146,7 +169,8 @@ L'équipe FrenchWeb`,
     read: true,
     urgency: "Faible",
     tag: "Email",
-    summary: "Revue hebdomadaire de l'actualité tech française, levées de fonds et tendances frameworks."
+    summary: "Revue hebdomadaire de l'actualité tech française, levées de fonds et tendances frameworks.",
+    summarySource: "ai"
   },
   {
     id: 5,
@@ -163,7 +187,8 @@ Isabelle Martin`,
     read: true,
     urgency: "Medium",
     tag: "Stage",
-    summary: "Isabelle Martin recherche un stage de 2 mois en développement web et souhaite découvrir React."
+    summary: "Isabelle Martin recherche un stage de 2 mois en développement web et souhaite découvrir React.",
+    summarySource: "ai"
   }
 ];
 
@@ -418,14 +443,26 @@ export default function App() {
             if (res.ok) {
               const data = await res.json();
               if (data.summary) {
-                updated[i] = { ...updated[i], summary: data.summary };
+                updated[i] = {
+                  ...updated[i],
+                  summary: data.summary,
+                  summarySource: data.source === "ai" ? "ai" : "fallback",
+                  summaryReason: data.source === "ai" ? undefined : data.reason,
+                };
                 changed = true;
               }
             }
           } catch (err) {
             console.log("Failed to generate auto summary for email " + updated[i].id + ", using local fallback.");
-            // Fallback summary
-            updated[i] = { ...updated[i], summary: updated[i].body.split(".")[0] + "." };
+            // The server itself is unreachable here (not just degraded) —
+            // still flag it as a fallback so the UI doesn't present this
+            // crude truncation as if it were a real AI summary.
+            updated[i] = {
+              ...updated[i],
+              summary: updated[i].body.split(".")[0] + ".",
+              summarySource: "fallback",
+              summaryReason: "network_error",
+            };
             changed = true;
           }
         }
@@ -469,6 +506,8 @@ export default function App() {
             if (sumResponse.ok) {
               const sumResult = await sumResponse.json();
               email.summary = sumResult.summary;
+              email.summarySource = sumResult.source === "ai" ? "ai" : "fallback";
+              email.summaryReason = sumResult.source === "ai" ? undefined : sumResult.reason;
               
               // Trigger persistent notification if it's not already shown
               setNotifications(prev => {
@@ -795,7 +834,7 @@ export default function App() {
               <div className="mt-1">
                 <h4 className="text-sm font-semibold text-slate-100 line-clamp-1">{notif.subject}</h4>
                 <p className="text-xs text-rose-300 mt-1.5 leading-relaxed bg-rose-950/25 p-2.5 rounded-lg border border-rose-500/10">
-                  <strong className="text-rose-200">Résumé IA :</strong> {notif.summary || "Génération du résumé..."}
+                  <strong className="text-rose-200">Résumé IA :</strong> {summaryLabel(notif, "Génération du résumé...")}
                 </p>
               </div>
 
@@ -903,17 +942,9 @@ export default function App() {
                   <Inbox size={15} />
                   <span>📬 Boîte de réception</span>
                 </div>
-                {connected && emails.filter(e => {
-                  const isNotified = notifiedEmailIds.includes(e.id);
-                  const isSent = sentEmailIds.includes(e.id);
-                  return (activated ? isNotified : true) && !isSent;
-                }).length > 0 && (
+                {connected && (emails.filter(e => e.urgency === "Important" && !sentEmailIds.includes(e.id)).length + autoReplyEntries.length) > 0 && (
                   <span className="bg-rose-500/10 text-rose-400 border border-rose-500/20 text-[9px] px-2 py-0.5 rounded-full font-bold">
-                    {emails.filter(e => {
-                      const isNotified = notifiedEmailIds.includes(e.id);
-                      const isSent = sentEmailIds.includes(e.id);
-                      return (activated ? isNotified : true) && !isSent;
-                    }).length}
+                    {emails.filter(e => e.urgency === "Important" && !sentEmailIds.includes(e.id)).length + autoReplyEntries.length}
                   </span>
                 )}
               </button>
@@ -1205,7 +1236,7 @@ export default function App() {
                                   <div className="p-3 bg-indigo-950/15 border border-indigo-500/10 rounded-lg text-[11px] text-indigo-200 italic mb-2 flex items-start gap-1.5">
                                     <Sparkles size={11} className="text-indigo-400 shrink-0 mt-0.5" />
                                     <span>
-                                      <strong>Résumé IA :</strong> {mail.summary}
+                                      <strong>Résumé IA :</strong> {summaryLabel(mail, "")}
                                     </span>
                                   </div>
                                 ) : (
@@ -1454,12 +1485,26 @@ export default function App() {
                     </div>
 
                     {currentMail.summary && (
-                      <div className="mt-5 p-4 bg-indigo-950/20 border border-indigo-500/20 rounded-xl">
-                        <div className="flex items-center gap-1.5 text-xs text-indigo-400 font-semibold mb-1">
+                      <div className={`mt-5 p-4 rounded-xl border ${
+                        currentMail.summarySource === "fallback"
+                          ? "bg-amber-950/20 border-amber-500/20"
+                          : "bg-indigo-950/20 border-indigo-500/20"
+                      }`}>
+                        <div className={`flex items-center gap-1.5 text-xs font-semibold mb-1 ${
+                          currentMail.summarySource === "fallback" ? "text-amber-400" : "text-indigo-400"
+                        }`}>
                           <Sparkles size={13} />
-                          <span>Résumé automatique de l'IA MailCraft</span>
+                          <span>
+                            {currentMail.summarySource === "fallback"
+                              ? "Résumé indisponible"
+                              : "Résumé automatique de l'IA MailCraft"}
+                          </span>
                         </div>
-                        <p className="text-xs text-indigo-200 leading-relaxed italic">{currentMail.summary}</p>
+                        <p className={`text-xs leading-relaxed italic ${
+                          currentMail.summarySource === "fallback" ? "text-amber-200" : "text-indigo-200"
+                        }`}>
+                          {summaryLabel(currentMail, "")}
+                        </p>
                       </div>
                     )}
 
@@ -1756,7 +1801,7 @@ export default function App() {
                                   <span className="text-[10px] text-indigo-300">De : {notif.from}</span>
                                 </div>
                                 <p className="text-[11px] text-slate-300 bg-rose-950/25 border border-rose-500/10 p-2.5 rounded-lg leading-relaxed mt-1">
-                                  <strong className="text-rose-300">Résumé IA :</strong> {notif.summary || "Calcul du résumé..."}
+                                  <strong className="text-rose-300">Résumé IA :</strong> {summaryLabel(notif, "Calcul du résumé...")}
                                 </p>
                                 <div className="flex justify-end mt-1">
                                   <button
