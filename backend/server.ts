@@ -247,15 +247,21 @@ function fallbackTriage(body: string) {
   }
 
   // Tag logic
+  // Order matters here: this is a fixed-priority chain, so whichever
+  // category is checked first wins on any overlap. Meeting/Stage/Study
+  // keywords tend to be more specific and less ambiguous than Job
+  // keywords (e.g. "meeting" rarely means anything else, but generic
+  // work-related words show up in almost every professional email), so
+  // check those first and leave Job as more of a fallback bucket.
   let tag = "Email";
-  if (["recrutement", "candidature", "cv", "job", "offre", "embauche", "poste", "work"].some(kw => content.includes(kw))) {
-    tag = "Job";
+  if (["réunion", "rdv", "rendez-vous", "meeting", "entretien", "visio", "call schedule"].some(kw => content.includes(kw))) {
+    tag = "Meeting";
   } else if (["stage", "stagiaire", "internship", "intern"].some(kw => content.includes(kw))) {
     tag = "Stage";
-  } else if (["cours", "étude", "université", "fac", "recherche", "examen", "school", "university", "academic", "etudiant"].some(kw => content.includes(kw))) {
+  } else if (["cours", "étude", "université", "fac", "recherche académique", "examen", "school", "university", "academic", "etudiant"].some(kw => content.includes(kw))) {
     tag = "Study";
-  } else if (["réunion", "rdv", "rendez-vous", "meeting", "call", "entretien", "visio", "schedule"].some(kw => content.includes(kw))) {
-    tag = "Meeting";
+  } else if (["recrutement", "candidature", "cv", "job", "offre d'emploi", "embauche", "poste à pourvoir", "hiring", "salaire"].some(kw => content.includes(kw))) {
+    tag = "Job";
   }
 
   return { urgency, tag };

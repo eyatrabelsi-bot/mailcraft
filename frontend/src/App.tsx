@@ -44,6 +44,7 @@ interface Email {
   tag?: string;
   summary?: string;
   gmailId?: string;   // stores the real Gmail message ID for replying
+  isAutoReply?: boolean; // true for synthetic entries representing a sent auto-reply
 }
 
 interface Baseline {
@@ -684,11 +685,29 @@ export default function App() {
            e.body.toLowerCase().includes(searchQuery.toLowerCase());
   });
 
-  // Filter standard Gmail folders on the left:
-  // - Inbox: shows standard emails (which are NOT notified and NOT auto-replied, as these are uploaded to MailCraft AI's inbox)
-  // - Sent: shows regular sent emails (and we can filter out sent IDs)
+  // Sent auto-replies, reshaped to the Email type so they can render in the
+  // same list as received mail. `from` is repurposed to show who the reply
+  // went to, since these are outbound, not inbound.
+  const autoReplyEntries: Email[] = sentEmails.map(s => ({
+    id: s.id,
+    from: `Réponse → ${s.to}`,
+    subject: s.subject,
+    body: s.body,
+    date: s.date,
+    read: true,
+    isAutoReply: true,
+  }));
+
+  // MailCraft AI's own inbox is a curated view, not a mirror of raw Gmail:
+  // - Inbox: only mail the AI classified as "Important", plus a copy of
+  //   every auto-reply MailCraft sent for a matched email. Everything else
+  //   (Medium/Faible, or not yet classified) stays out of this list.
+  // - Sent: regular sent emails (validated drafts + auto-replies)
   const displayEmails = activeFolder === "inbox"
-    ? filteredEmails.filter(e => (activated ? !notifiedEmailIds.includes(e.id) : true) && !sentEmailIds.includes(e.id))
+    ? [
+        ...filteredEmails.filter(e => e.urgency === "Important" && !sentEmailIds.includes(e.id)),
+        ...autoReplyEntries,
+      ].sort((a, b) => b.id - a.id)
     : filteredEmails.filter(e => !sentEmailIds.includes(e.id));
 
   return (
@@ -1434,7 +1453,7 @@ export default function App() {
                   <div className="px-5 pb-3 border-b border-slate-800/60 flex items-center justify-between text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
                     <span>
                       {activeFolder === "inbox" 
-                        ? "📬 Boîte de réception principale (Gmail)" 
+                        ? "🛡️ Boîte de réception MailCraft AI (Important + réponses auto)" 
                         : "Messages de la boîte"}
                     </span>
                     {activeFolder === "inbox" && (
@@ -1447,18 +1466,29 @@ export default function App() {
                   {displayEmails.length === 0 ? (
                     <div className="p-12 text-center text-slate-500">
                       <Mail size={32} className="mx-auto text-slate-600 mb-2 stroke-[1.5]" />
-                      <p className="text-xs">Aucun email trouvé correspondant à votre recherche.</p>
+                      <p className="text-xs">
+                        {searchQuery.trim() !== ""
+                          ? "Aucun email trouvé correspondant à votre recherche."
+                          : activeFolder === "inbox"
+                          ? "Aucun email important pour l'instant. Les emails classés Important et les réponses automatiques apparaîtront ici."
+                          : "Aucun message."}
+                      </p>
                     </div>
                   ) : (
                     <div className="divide-y divide-slate-800/60">
                       {displayEmails.map((mail) => (
                         <div
                           key={mail.id}
-                          onClick={() => handleSelectMail(mail)}
-                          className={`p-4.5 hover:bg-slate-800/30 transition-all cursor-pointer flex flex-col gap-2 ${!mail.read ? "bg-slate-800/10 border-l-2 border-indigo-500" : ""}`}
+                          onClick={() => !mail.isAutoReply && handleSelectMail(mail)}
+                          className={`p-4.5 transition-all flex flex-col gap-2 ${
+                            mail.isAutoReply
+                              ? "bg-emerald-950/10 border-l-2 border-emerald-600/50 cursor-default"
+                              : `hover:bg-slate-800/30 cursor-pointer ${!mail.read ? "bg-slate-800/10 border-l-2 border-indigo-500" : ""}`
+                          }`}
                         >
                           <div className="flex items-center justify-between gap-2">
-                            <span className={`text-xs ${!mail.read ? "font-bold text-slate-100" : "text-slate-300"}`}>
+                            <span className={`text-xs flex items-center gap-1.5 ${!mail.read ? "font-bold text-slate-100" : "text-slate-300"}`}>
+                              {mail.isAutoReply && <SendHorizontal size={11} className="text-emerald-400 shrink-0" />}
                               {mail.from}
                             </span>
                             <span className="text-[10px] text-slate-500">{mail.date}</span>
@@ -1471,7 +1501,11 @@ export default function App() {
 
                             {/* Live classified tags inside the Gmail interface */}
                             <div className="flex items-center gap-1.5 shrink-0">
-                              {mail.urgency ? (
+                              {mail.isAutoReply ? (
+                                <span className="text-[9px] px-2 py-0.5 rounded-full text-emerald-300 font-bold uppercase tracking-wider bg-emerald-500/15 border border-emerald-500/30">
+                                  Réponse auto envoyée
+                                </span>
+                              ) : mail.urgency ? (
                                 <>
                                   <span className={`text-[9px] px-2 py-0.5 rounded-full text-slate-100 font-bold uppercase tracking-wider ${
                                     mail.urgency === "Important" ? "bg-rose-500/20 text-rose-300 border border-rose-500/30" :

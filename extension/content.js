@@ -5,6 +5,7 @@
 // as they appear.
 
 const PROCESSED_ATTR = "data-mailcraft-processed";
+const IN_FLIGHT_ATTR = "data-mailcraft-pending";
 
 // --- Selectors -------------------------------------------------------
 // tr.zA has identified an inbox row in Gmail's DOM for a long time and is
@@ -25,10 +26,11 @@ function extractRowData(row) {
   const subject = subjectEl?.textContent?.trim() || "";
   const snippet = snippetEl?.textContent?.trim() || "";
 
-  // Gmail doesn't expose a clean, stable thread ID in the row markup across
-  // all versions. Fall back to a composite key if a real ID isn't found.
+  // Gmail's real thread ID lives on a nested span (data-legacy-thread-id),
+  // not on the row itself. row.id (":6a" etc.) is a transient DOM id that
+  // changes between page loads, so prefer the real thread ID when present.
   const threadId =
-    row.getAttribute("data-legacy-thread-id") ||
+    row.querySelector("[data-legacy-thread-id]")?.getAttribute("data-legacy-thread-id") ||
     row.id ||
     `${sender}::${subject}`;
 
@@ -50,33 +52,64 @@ function makeBadge(label) {
 function injectLoadingBadge(row) {
   const badge = makeBadge("…");
   badge.classList.add("mailcraft-badge--loading");
-  // .xW / .xY are the cell Gmail uses for the subject column in most
-  // layouts; inserting before it puts the badge right next to the subject.
-  const anchor = row.querySelector(".xY") || row.querySelector(".xW") || row;
-  anchor.parentElement?.insertBefore(badge, anchor);
+
+  // Insert right before the subject text itself, inside its own
+  // container (div.y6 in current Gmail markup). We deliberately don't
+  // target a generic cell class like .xY: that class is shared by many
+  // unrelated cells in the row (checkbox cell, a narrow spacer cell,
+  // etc.), which is why badges were landing in the wrong, clipped
+  // leftmost column before. Anchoring to the subject element itself is
+  // more precise and more resistant to Gmail's markup shuffling classes
+  // around.
+  const subjectEl = row.querySelector(SUBJECT_SELECTOR);
+  if (subjectEl && subjectEl.parentElement) {
+    subjectEl.parentElement.insertBefore(badge, subjectEl);
+  } else {
+    // Fallback: the dedicated subject/snippet cell seen in current Gmail
+    // markup (td.a4W). Still never attach directly to <tr>.
+    const cell = row.querySelector("td.a4W") || row.querySelector("td");
+    cell?.insertBefore(badge, cell.firstChild);
+  }
   return badge;
 }
 
 function classifyRow(row) {
-  if (row.hasAttribute(PROCESSED_ATTR)) return;
-  row.setAttribute(PROCESSED_ATTR, "true");
+  if (row.hasAttribute(IN_FLIGHT_ATTR)) return;
+
+  // Gmail frequently recycles a row's <tr> node in place (rewriting the
+  // subject/snippet cell's innerHTML after the list "settles") without
+  // ever removing/re-adding the <tr> itself. That wipes out our injected
+  // badge but leaves PROCESSED_ATTR sitting on the row, so trusting the
+  // attribute alone causes permanently-blank rows. Verify the badge is
+  // still actually present before trusting "processed".
+  if (row.hasAttribute(PROCESSED_ATTR) && row.querySelector(".mailcraft-badge")) {
+    return;
+  }
+  row.removeAttribute(PROCESSED_ATTR);
+  row.setAttribute(IN_FLIGHT_ATTR, "true");
 
   const data = extractRowData(row);
-  if (!data.subject && !data.sender) return; // nothing usable found, skip
+  if (!data.subject && !data.sender) {
+    row.removeAttribute(IN_FLIGHT_ATTR);
+    return; // nothing usable found, skip
+  }
 
   const badgeEl = injectLoadingBadge(row);
 
   chrome.runtime.sendMessage(
     { type: "CLASSIFY_EMAIL", payload: { threadId: data.threadId, body: data.body } },
     (response) => {
-      if (chrome.runtime.lastError) {
+      row.removeAttribute(IN_FLIGHT_ATTR);
+
+      if (chrome.runtime.lastError || !response?.ok) {
+        // Leave the row unmarked so the next observer pass or periodic
+        // sweep retries it, instead of permanently skipping it.
         badgeEl.remove();
         return;
       }
-      if (!response?.ok) {
-        badgeEl.remove();
-        return;
-      }
+
+      row.setAttribute(PROCESSED_ATTR, "true");
+
       // /api/triage returns { urgency, tag }
       const { urgency, tag } = response.result;
       badgeEl.textContent = tag || urgency || "?";
@@ -103,9 +136,20 @@ const observer = new MutationObserver((mutations) => {
         classifyRow(node);
       } else {
         scanForRows(node);
+        // The added node may be content *inside* an already-existing row
+        // (Gmail rewriting a cell in place) rather than a new row itself.
+        // querySelectorAll only looks at descendants, so also check
+        // upward for an ancestor row that needs re-verifying.
+        const ancestorRow = node.closest?.(ROW_SELECTOR);
+        if (ancestorRow) classifyRow(ancestorRow);
       }
     }
   }
 });
 
 observer.observe(document.body, { childList: true, subtree: true });
+
+// Safety net: rows that failed (server briefly unreachable, etc.) get
+// unmarked but nothing guarantees a DOM mutation touches them again. Sweep
+// periodically to catch and retry those.
+setInterval(() => scanForRows(), 5000);
