@@ -307,16 +307,37 @@ export default function App() {
       const res = await fetch("/api/gmail/inbox");
       if (!res.ok) return;
       const data = await res.json();
-      const realEmails: Email[] = (data.emails || []).map((e: any, idx: number) => ({
-        id: idx + 1,
-        gmailId: e.id,
-        from: e.from,
-        subject: e.subject,
-        body: e.body,
-        date: e.date,
-        read: e.read,
-      }));
-      setEmails(realEmails);
+      const incoming: any[] = data.emails || [];
+
+      setEmails(prev => {
+        // Key by gmailId (the real, stable Gmail message id) rather than
+        // array index, so a poll that finds new mail at the top doesn't
+        // shift everyone else's identity. For emails we already have,
+        // keep whatever MailCraft already computed (urgency/tag/summary)
+        // instead of clobbering it with a blank re-fetched copy — that's
+        // what was forcing a full silent re-triage/re-summarize on every
+        // refresh, and made "new mail" indistinguishable from "lost all
+        // classifications".
+        const existingByGmailId = new Map(prev.map(e => [e.gmailId, e]));
+        let nextLocalId = prev.reduce((max, e) => Math.max(max, e.id), 0) + 1;
+
+        const merged: Email[] = incoming.map((e: any) => {
+          const existing = existingByGmailId.get(e.id);
+          if (existing) {
+            return { ...existing, from: e.from, subject: e.subject, body: e.body, date: e.date, read: e.read };
+          }
+          return {
+            id: nextLocalId++,
+            gmailId: e.id,
+            from: e.from,
+            subject: e.subject,
+            body: e.body,
+            date: e.date,
+            read: e.read,
+          };
+        });
+        return merged;
+      });
     } catch (err) {
       console.error("Failed to load real inbox:", err);
     }
@@ -340,6 +361,35 @@ export default function App() {
     };
     checkAuth();
   }, []);
+
+  // Poll for new mail while connected — this is what was missing entirely
+  // before: fetchRealInbox only ever ran once, on mount, so nothing short
+  // of a full page reload (F5) would ever pick up mail that arrived after
+  // that. fetchRealInbox itself now merges by gmailId (see above) so this
+  // poll won't reset classification work already done on existing mail —
+  // it only adds genuinely new messages. triggerTriage() is safe to call
+  // repeatedly since it already skips anything with .urgency set, so it
+  // will only classify (and, for Important, summarize + notify) the
+  // newly-arrived ones each cycle.
+  useEffect(() => {
+    if (!connected) return;
+    const intervalId = setInterval(fetchRealInbox, 25000);
+    return () => clearInterval(intervalId);
+  }, [connected]);
+
+  // Classify any mail that doesn't have a urgency yet — covers both the
+  // initial fetch and anything the poll above just merged in. Deliberately
+  // a separate effect (rather than chaining off the poll directly) so it
+  // always closes over the current `emails`/`triggerTriage`; chaining
+  // triggerTriage() straight off the interval's setInterval callback would
+  // capture a stale closure from whenever [connected] last changed, not
+  // the freshly-merged state.
+  useEffect(() => {
+    if (!activated || isClassifying) return;
+    if (emails.some(e => !e.urgency)) {
+      triggerTriage();
+    }
+  }, [emails, activated]);
 
   // Scroll to bottom when new messages are added or loaded
   useEffect(() => {

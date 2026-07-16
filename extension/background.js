@@ -8,9 +8,50 @@
 // /api/gmail/* routes, so no cookies/credentials required here.
 const BACKEND_URL = "http://localhost:3000/api/triage";
 
-// Simple in-memory cache so we don't re-classify the same email every time
-// Gmail re-renders a row (which it does often, e.g. on scroll).
+// --- Persistent classification cache --------------------------------------
+// IMPORTANT: this is a Manifest V3 background *service worker*, not a
+// long-lived background page. Chrome unloads it after ~30s of inactivity
+// and restarts it fresh on the next event (e.g. Gmail syncing new mail).
+// A plain in-memory Map does NOT survive that restart — every restart was
+// silently wiping all cached classifications, which is why a new-mail
+// arrival (which also makes Gmail rebuild its row DOM wholesale) caused
+// the *entire* visible inbox to re-classify from scratch instead of just
+// the new row. chrome.storage.local persists across restarts, so we use
+// it as the source of truth, with an in-memory Map as a same-tick cache
+// on top of it while the worker happens to be alive.
+const STORAGE_KEY = "mailcraft_classification_cache";
+const MAX_CACHE_ENTRIES = 1000; // bound growth; oldest entries evicted first
+
 const classificationCache = new Map();
+let cacheLoaded = false;
+let cacheLoadPromise = null;
+
+function loadCacheFromStorage() {
+  if (cacheLoadPromise) return cacheLoadPromise;
+  cacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([STORAGE_KEY], (result) => {
+      const stored = result[STORAGE_KEY] || {};
+      for (const [threadId, value] of Object.entries(stored)) {
+        classificationCache.set(threadId, value);
+      }
+      cacheLoaded = true;
+      resolve();
+    });
+  });
+  return cacheLoadPromise;
+}
+
+function persistCache() {
+  // Evict oldest entries (Map preserves insertion order) once we exceed
+  // the cap, so storage.local doesn't grow unbounded over time.
+  while (classificationCache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = classificationCache.keys().next().value;
+    classificationCache.delete(oldestKey);
+  }
+  const asObject = Object.fromEntries(classificationCache);
+  chrome.storage.local.set({ [STORAGE_KEY]: asObject });
+}
+// ---------------------------------------------------------------------------
 
 // --- Full-body fetch via the extension's OWN Gmail OAuth token -----------
 // We deliberately do NOT reuse the web app's backend session (server.ts's
@@ -75,12 +116,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   const { threadId, body: snippetBody } = message.payload;
 
-  if (classificationCache.has(threadId)) {
-    sendResponse({ ok: true, result: classificationCache.get(threadId) });
-    return true;
-  }
-
   (async () => {
+    // On a cold service-worker start, the Map starts empty until storage
+    // finishes loading — wait for that first so we don't miss a real hit.
+    if (!cacheLoaded) await loadCacheFromStorage();
+
+    if (classificationCache.has(threadId)) {
+      sendResponse({ ok: true, result: classificationCache.get(threadId) });
+      return;
+    }
+
     // Try to get the real full body first; if Gmail API/auth fails for
     // any reason, fall back to the subject+snippet content.js already
     // scraped, rather than failing the row outright. Full body gives a
@@ -105,6 +150,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const data = await res.json();
       // Real shape from /api/triage: { urgency, tag }
       classificationCache.set(threadId, data);
+      persistCache();
       sendResponse({ ok: true, result: data });
     } catch (err) {
       sendResponse({ ok: false, error: err.message });

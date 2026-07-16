@@ -96,27 +96,58 @@ function classifyRow(row) {
 
   const badgeEl = injectLoadingBadge(row);
 
-  chrome.runtime.sendMessage(
-    { type: "CLASSIFY_EMAIL", payload: { threadId: data.threadId, body: data.body } },
-    (response) => {
-      row.removeAttribute(IN_FLIGHT_ATTR);
+  // chrome.runtime.sendMessage throws SYNCHRONOUSLY (not via the callback's
+  // chrome.runtime.lastError) when the extension's context has gone stale —
+  // this happens whenever the extension is reloaded/updated from
+  // chrome://extensions while this Gmail tab is still open from before
+  // that reload. At that point nothing in this content script can recover
+  // on its own; the only fix is reloading the Gmail tab itself. Detect it
+  // and shut down cleanly instead of spamming "Extension context
+  // invalidated" on every row, every observer tick, forever.
+  try {
+    chrome.runtime.sendMessage(
+      { type: "CLASSIFY_EMAIL", payload: { threadId: data.threadId, body: data.body } },
+      (response) => {
+        row.removeAttribute(IN_FLIGHT_ATTR);
 
-      if (chrome.runtime.lastError || !response?.ok) {
-        // Leave the row unmarked so the next observer pass or periodic
-        // sweep retries it, instead of permanently skipping it.
-        badgeEl.remove();
-        return;
+        if (chrome.runtime.lastError || !response?.ok) {
+          // Leave the row unmarked so the next observer pass or periodic
+          // sweep retries it, instead of permanently skipping it.
+          badgeEl.remove();
+          return;
+        }
+
+        row.setAttribute(PROCESSED_ATTR, "true");
+
+        // /api/triage returns { urgency, tag }
+        const { urgency, tag } = response.result;
+        badgeEl.textContent = tag || urgency || "?";
+        badgeEl.classList.remove("mailcraft-badge--loading");
+        badgeEl.classList.add(`mailcraft-badge--${(urgency || "default").toLowerCase()}`);
       }
-
-      row.setAttribute(PROCESSED_ATTR, "true");
-
-      // /api/triage returns { urgency, tag }
-      const { urgency, tag } = response.result;
-      badgeEl.textContent = tag || urgency || "?";
-      badgeEl.classList.remove("mailcraft-badge--loading");
-      badgeEl.classList.add(`mailcraft-badge--${(urgency || "default").toLowerCase()}`);
+    );
+  } catch (err) {
+    row.removeAttribute(IN_FLIGHT_ATTR);
+    badgeEl.remove();
+    if (err.message?.includes("Extension context invalidated")) {
+      handleStaleContext();
     }
+  }
+}
+
+// Once the extension context is confirmed stale, stop all further work —
+// the observer and periodic sweep would otherwise keep hitting the same
+// error on every row, forever, until the tab is manually reloaded.
+let contextInvalidated = false;
+function handleStaleContext() {
+  if (contextInvalidated) return;
+  contextInvalidated = true;
+  console.warn(
+    "[MailCraft] Extension was reloaded/updated while this Gmail tab stayed open. " +
+    "Badges are paused — reload this tab to reconnect."
   );
+  observer.disconnect();
+  clearInterval(sweepIntervalId);
 }
 
 function scanForRows(root = document) {
@@ -152,4 +183,4 @@ observer.observe(document.body, { childList: true, subtree: true });
 // Safety net: rows that failed (server briefly unreachable, etc.) get
 // unmarked but nothing guarantees a DOM mutation touches them again. Sweep
 // periodically to catch and retry those.
-setInterval(() => scanForRows(), 5000);
+const sweepIntervalId = setInterval(() => scanForRows(), 5000);
