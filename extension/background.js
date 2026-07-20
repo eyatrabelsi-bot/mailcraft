@@ -1,236 +1,272 @@
-// background.js
-// Runs in its own isolated context, NOT subject to mail.google.com's CSP.
-// This is why the fetch to your backend happens here instead of in content.js.
+// content.js
+// Runs only on mail.google.com (see manifest.json "matches").
+// Gmail is a single-page app that constantly re-renders its DOM, so we can't
+// just run once on page load — we watch for changes and process new rows
+// as they appear.
 
-// Your existing endpoint (server.ts line ~567). Takes { body } and returns
-// { urgency: "Important" | "Medium" | "Faible", tag: string }.
-// No auth needed — this route doesn't check req.session, unlike the
-// /api/gmail/* routes, so no cookies/credentials required here.
-const BACKEND_URL = "http://localhost:3000/api/triage";
+const PROCESSED_ATTR = "data-mailcraft-processed";
+const IN_FLIGHT_ATTR = "data-mailcraft-pending";
 
-// --- Persistent classification cache --------------------------------------
-// IMPORTANT: this is a Manifest V3 background *service worker*, not a
-// long-lived background page. Chrome unloads it after ~30s of inactivity
-// and restarts it fresh on the next event (e.g. Gmail syncing new mail).
-// A plain in-memory Map does NOT survive that restart — every restart was
-// silently wiping all cached classifications, which is why a new-mail
-// arrival (which also makes Gmail rebuild its row DOM wholesale) caused
-// the *entire* visible inbox to re-classify from scratch instead of just
-// the new row. chrome.storage.local persists across restarts, so we use
-// it as the source of truth, with an in-memory Map as a same-tick cache
-// on top of it while the worker happens to be alive.
-const STORAGE_KEY = "mailcraft_classification_cache";
-const MAX_CACHE_ENTRIES = 1000; // bound growth; oldest entries evicted first
+// --- Selectors -------------------------------------------------------
+// tr.zA has identified an inbox row in Gmail's DOM for a long time and is
+// the selector most Gmail extensions rely on. Still: open devtools on your
+// own Gmail, inspect a row, and confirm/adjust these before relying on them.
+const ROW_SELECTOR = "tr.zA";
+const SENDER_SELECTOR = "[email]"; // sender spans carry an `email` attribute
+const SUBJECT_SELECTOR = ".bog"; // subject text span
+const SNIPPET_SELECTOR = ".y2"; // preview text Gmail shows after the subject
+// -----------------------------------------------------------------------
 
-const classificationCache = new Map();
-let cacheLoaded = false;
-let cacheLoadPromise = null;
+function extractRowData(row) {
+  const senderEl = row.querySelector(SENDER_SELECTOR);
+  const subjectEl = row.querySelector(SUBJECT_SELECTOR);
+  const snippetEl = row.querySelector(SNIPPET_SELECTOR);
 
-function loadCacheFromStorage() {
-  if (cacheLoadPromise) return cacheLoadPromise;
-  cacheLoadPromise = new Promise((resolve) => {
-    chrome.storage.local.get([STORAGE_KEY], (result) => {
-      const stored = result[STORAGE_KEY] || {};
-      for (const [threadId, value] of Object.entries(stored)) {
-        classificationCache.set(threadId, value);
-      }
-      cacheLoaded = true;
-      resolve();
-    });
-  });
-  return cacheLoadPromise;
+  const sender = senderEl?.getAttribute("email") || senderEl?.textContent?.trim() || "";
+  const subject = subjectEl?.textContent?.trim() || "";
+  const snippet = snippetEl?.textContent?.trim() || "";
+
+  // Gmail's real thread ID lives on a nested span (data-legacy-thread-id),
+  // not on the row itself. row.id (":6a" etc.) is a transient DOM id that
+  // changes between page loads, so prefer the real thread ID when present.
+  const threadId =
+    row.querySelector("[data-legacy-thread-id]")?.getAttribute("data-legacy-thread-id") ||
+    row.id ||
+    `${sender}::${subject}`;
+
+  // /api/triage classifies a single `body` string — the list view only has
+  // subject + a truncated snippet, not the full email, but that's enough
+  // signal for urgency/tag classification.
+  const body = [subject, snippet].filter(Boolean).join("\n");
+
+  return { threadId, sender, subject, body };
 }
 
-function persistCache() {
-  // Evict oldest entries (Map preserves insertion order) once we exceed
-  // the cap, so storage.local doesn't grow unbounded over time.
-  while (classificationCache.size > MAX_CACHE_ENTRIES) {
-    const oldestKey = classificationCache.keys().next().value;
-    classificationCache.delete(oldestKey);
+function makeBadge(label) {
+  const badge = document.createElement("span");
+  badge.className = "mailcraft-badge";
+  badge.textContent = label;
+  return badge;
+}
+
+function injectLoadingBadge(row) {
+  const badge = makeBadge("…");
+  badge.classList.add("mailcraft-badge--loading");
+
+  // Insert right before the subject text itself, inside its own
+  // container (div.y6 in current Gmail markup). We deliberately don't
+  // target a generic cell class like .xY: that class is shared by many
+  // unrelated cells in the row (checkbox cell, a narrow spacer cell,
+  // etc.), which is why badges were landing in the wrong, clipped
+  // leftmost column before. Anchoring to the subject element itself is
+  // more precise and more resistant to Gmail's markup shuffling classes
+  // around.
+  const subjectEl = row.querySelector(SUBJECT_SELECTOR);
+  if (subjectEl && subjectEl.parentElement) {
+    subjectEl.parentElement.insertBefore(badge, subjectEl);
+  } else {
+    // Fallback: the dedicated subject/snippet cell seen in current Gmail
+    // markup (td.a4W). Still never attach directly to <tr>.
+    const cell = row.querySelector("td.a4W") || row.querySelector("td");
+    cell?.insertBefore(badge, cell.firstChild);
   }
-  const asObject = Object.fromEntries(classificationCache);
-  chrome.storage.local.set({ [STORAGE_KEY]: asObject });
-}
-// ---------------------------------------------------------------------------
-
-// --- Full-body fetch via the extension's OWN Gmail OAuth token -----------
-// We deliberately do NOT reuse the web app's backend session (server.ts's
-// express-session cookie is SameSite: Lax, and a background-worker fetch
-// to a different origin is cross-site, so the cookie wouldn't be sent
-// anyway without weakening session security). Instead the extension gets
-// its own token via chrome.identity and talks to the Gmail API directly.
-// This requires:
-//   1. manifest.json: "identity" permission + an "oauth2" block with a
-//      client_id and the gmail.readonly scope
-//   2. manifest.json: host_permissions including
-//      "https://gmail.googleapis.com/*"
-// See the manifest.json diff alongside this file.
-
-function getAuthToken() {
-  return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive: true }, (token) => {
-      if (chrome.runtime.lastError || !token) {
-        reject(new Error(chrome.runtime.lastError?.message || "No token"));
-        return;
-      }
-      resolve(token);
-    });
-  });
+  return badge;
 }
 
-// Same base64url decode + multi-part walk server.ts does for /api/gmail/inbox
-// (kept in sync with the extractBody logic there) — plain text, then
-// falls back to nothing if the thread is HTML-only.
-function extractPlainTextBody(payload) {
-  if (!payload) return "";
-  if (payload.mimeType === "text/plain" && payload.body?.data) {
-    return atob(payload.body.data.replace(/-/g, "+").replace(/_/g, "/"));
+function classifyRow(row) {
+  if (row.hasAttribute(IN_FLIGHT_ATTR)) return;
+
+  // Gmail frequently recycles a row's <tr> node in place (rewriting the
+  // subject/snippet cell's innerHTML after the list "settles") without
+  // ever removing/re-adding the <tr> itself. That wipes out our injected
+  // badge but leaves PROCESSED_ATTR sitting on the row, so trusting the
+  // attribute alone causes permanently-blank rows. Verify the badge is
+  // still actually present before trusting "processed".
+  if (row.hasAttribute(PROCESSED_ATTR) && row.querySelector(".mailcraft-badge")) {
+    return;
   }
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      const result = extractPlainTextBody(part);
-      if (result) return result;
+  row.removeAttribute(PROCESSED_ATTR);
+  row.setAttribute(IN_FLIGHT_ATTR, "true");
+
+  const data = extractRowData(row);
+  if (!data.subject && !data.sender) {
+    row.removeAttribute(IN_FLIGHT_ATTR);
+    return; // nothing usable found, skip
+  }
+
+  const badgeEl = injectLoadingBadge(row);
+
+  // chrome.runtime.sendMessage throws SYNCHRONOUSLY (not via the callback's
+  // chrome.runtime.lastError) when the extension's context has gone stale —
+  // this happens whenever the extension is reloaded/updated from
+  // chrome://extensions while this Gmail tab is still open from before
+  // that reload. At that point nothing in this content script can recover
+  // on its own; the only fix is reloading the Gmail tab itself. Detect it
+  // and shut down cleanly instead of spamming "Extension context
+  // invalidated" on every row, every observer tick, forever.
+  try {
+    chrome.runtime.sendMessage(
+      { type: "CLASSIFY_EMAIL", payload: { threadId: data.threadId, body: data.body } },
+      (response) => {
+        row.removeAttribute(IN_FLIGHT_ATTR);
+
+        if (chrome.runtime.lastError || !response?.ok) {
+          // Leave the row unmarked so the next observer pass or periodic
+          // sweep retries it, instead of permanently skipping it.
+          badgeEl.remove();
+          return;
+        }
+
+        row.setAttribute(PROCESSED_ATTR, "true");
+
+        // /api/triage returns { urgency, tag }
+        const { urgency, tag } = response.result;
+        badgeEl.textContent = tag || urgency || "?";
+        badgeEl.classList.remove("mailcraft-badge--loading");
+        badgeEl.classList.add(`mailcraft-badge--${(urgency || "default").toLowerCase()}`);
+      }
+    );
+  } catch (err) {
+    row.removeAttribute(IN_FLIGHT_ATTR);
+    badgeEl.remove();
+    if (err.message?.includes("Extension context invalidated")) {
+      handleStaleContext();
     }
   }
-  return "";
 }
 
-async function fetchFullBody(threadId) {
-  const token = await getAuthToken();
-  const res = await fetch(
-    `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}?format=full`,
-    { headers: { Authorization: `Bearer ${token}` } }
+// Once the extension context is confirmed stale, stop all further work —
+// the observer and periodic sweep would otherwise keep hitting the same
+// error on every row, forever, until the tab is manually reloaded.
+let contextInvalidated = false;
+function handleStaleContext() {
+  if (contextInvalidated) return;
+  contextInvalidated = true;
+  console.warn(
+    "[MailCraft] Extension was reloaded/updated while this Gmail tab stayed open. " +
+    "Badges are paused — reload this tab to reconnect."
   );
-  if (!res.ok) throw new Error(`Gmail API returned ${res.status}`);
-  const thread = await res.json();
-
-  // Use the most recent message in the thread — closest to what a person
-  // actually cares about triaging (matches list-view ordering).
-  const messages = thread.messages || [];
-  const latest = messages[messages.length - 1];
-  return extractPlainTextBody(latest?.payload) || "";
+  observer.disconnect();
+  clearInterval(sweepIntervalId);
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== "CLASSIFY_EMAIL") return false;
+function scanForRows(root = document) {
+  root.querySelectorAll(ROW_SELECTOR).forEach(classifyRow);
+}
 
-  const { threadId, body: snippetBody } = message.payload;
+// --- Thread view: inject an AI summary above the real message body -------
+// div.a3s is Gmail's rendered message body once a thread/email is opened.
+// The full text is already sitting in the DOM at that point (Gmail fetched
+// it to display it), so we read it straight from there instead of hitting
+// the Gmail API again the way CLASSIFY_EMAIL does for the list view.
+const SUMMARY_BODY_SELECTOR = "div.a3s";
+const SUMMARY_PROCESSED_ATTR = "data-mailcraft-summary-processed";
 
-  (async () => {
-    // On a cold service-worker start, the Map starts empty until storage
-    // finishes loading — wait for that first so we don't miss a real hit.
-    if (!cacheLoaded) await loadCacheFromStorage();
+function getOpenThreadId() {
+  // While a thread is open, Gmail's URL hash looks like
+  // "#inbox/FMfcgzQXJkxxxxx" — the last segment is a stable id for the
+  // currently open thread. It won't always match the legacy numeric
+  // thread id used in the list view, but that's fine here: this id is
+  // only used as this feature's own cache key, not passed to the Gmail API.
+  const hash = location.hash || "";
+  const parts = hash.split("/");
+  return parts[parts.length - 1] || hash;
+}
 
-    if (classificationCache.has(threadId)) {
-      sendResponse({ ok: true, result: classificationCache.get(threadId) });
-      return;
-    }
+function makeSummaryBox() {
+  const box = document.createElement("div");
+  box.className = "mailcraft-summary-box mailcraft-summary-box--loading";
+  box.textContent = "✨ Génération du résumé...";
+  return box;
+}
 
-    // Try to get the real full body first; if Gmail API/auth fails for
-    // any reason, fall back to the subject+snippet content.js already
-    // scraped, rather than failing the row outright. Full body gives a
-    // much better classification (catches things like purge/deadline
-    // warnings that a truncated snippet misses entirely), but degraded
-    // triage beats no triage.
-    let body = snippetBody;
-    try {
-      const fullBody = await fetchFullBody(threadId);
-      if (fullBody) body = fullBody;
-    } catch (err) {
-      console.warn("[MailCraft] Full-body fetch failed, using snippet:", err.message);
-    }
+function summarizeOpenBody(bodyEl) {
+  if (bodyEl.hasAttribute(SUMMARY_PROCESSED_ATTR)) return;
 
-    try {
-      const res = await fetch(BACKEND_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
-      });
-      if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-      const data = await res.json();
-      // Real shape from /api/triage: { urgency, tag }
-      classificationCache.set(threadId, data);
-      persistCache();
-      sendResponse({ ok: true, result: data });
-    } catch (err) {
-      sendResponse({ ok: false, error: err.message });
-    }
-  })();
+  const text = bodyEl.innerText?.trim();
+  if (!text) return;
 
-  // Required: keep the message channel open for the async response above.
-  return true;
-});
+  bodyEl.setAttribute(SUMMARY_PROCESSED_ATTR, "true");
 
-// --- Summary endpoint (thread view, injected above the real body) --------
-// Same shape of problem as the classification cache above: this is still
-// the same service worker, so it gets unloaded/restarted just as
-// aggressively. Reusing the classification cache's key would collide
-// (different payload shape), so this gets its own storage key + Map.
-const SUMMARY_BACKEND_URL = "http://localhost:3000/api/summary";
-const SUMMARY_STORAGE_KEY = "mailcraft_summary_cache";
-const MAX_SUMMARY_CACHE_ENTRIES = 500;
+  const threadId = getOpenThreadId();
+  const box = makeSummaryBox();
+  bodyEl.parentElement?.insertBefore(box, bodyEl);
 
-const summaryCache = new Map();
-let summaryCacheLoaded = false;
-let summaryCacheLoadPromise = null;
+  try {
+    chrome.runtime.sendMessage(
+      { type: "SUMMARIZE_EMAIL", payload: { threadId, body: text } },
+      (response) => {
+        if (chrome.runtime.lastError || !response?.ok) {
+          // Let a later pass retry instead of leaving a permanently blank
+          // or stuck-loading box.
+          box.remove();
+          bodyEl.removeAttribute(SUMMARY_PROCESSED_ATTR);
+          return;
+        }
 
-function loadSummaryCacheFromStorage() {
-  if (summaryCacheLoadPromise) return summaryCacheLoadPromise;
-  summaryCacheLoadPromise = new Promise((resolve) => {
-    chrome.storage.local.get([SUMMARY_STORAGE_KEY], (result) => {
-      const stored = result[SUMMARY_STORAGE_KEY] || {};
-      for (const [threadId, value] of Object.entries(stored)) {
-        summaryCache.set(threadId, value);
+        // /api/summary returns { summary }
+        box.textContent = `✨ ${response.result.summary}`;
+        box.classList.remove("mailcraft-summary-box--loading");
       }
-      summaryCacheLoaded = true;
-      resolve();
-    });
-  });
-  return summaryCacheLoadPromise;
-}
-
-function persistSummaryCache() {
-  while (summaryCache.size > MAX_SUMMARY_CACHE_ENTRIES) {
-    const oldestKey = summaryCache.keys().next().value;
-    summaryCache.delete(oldestKey);
+    );
+  } catch (err) {
+    box.remove();
+    bodyEl.removeAttribute(SUMMARY_PROCESSED_ATTR);
+    if (err.message?.includes("Extension context invalidated")) {
+      handleStaleContext();
+    }
   }
-  const asObject = Object.fromEntries(summaryCache);
-  chrome.storage.local.set({ [SUMMARY_STORAGE_KEY]: asObject });
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== "SUMMARIZE_EMAIL") return false;
+function scanForOpenBodies(root = document) {
+  root.querySelectorAll(SUMMARY_BODY_SELECTOR).forEach(summarizeOpenBody);
+}
 
-  // content.js sends the FULL body text scraped directly from the open
-  // thread's rendered DOM (div.a3s) — Gmail has already fetched and
-  // rendered it at that point, so there's no need to hit the Gmail API
-  // again here the way CLASSIFY_EMAIL does for the list view.
-  const { threadId, body } = message.payload;
+// Initial pass, in case rows/an already-open thread are present when the
+// script loads.
+scanForRows();
+scanForOpenBodies();
 
-  (async () => {
-    if (!summaryCacheLoaded) await loadSummaryCacheFromStorage();
+// Gmail loads/re-renders rows continuously (scrolling, new mail, switching
+// views), so we watch the whole app container for added nodes.
+const observer = new MutationObserver((mutations) => {
+  for (const mutation of mutations) {
+    for (const node of mutation.addedNodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      if (node.matches?.(ROW_SELECTOR)) {
+        classifyRow(node);
+      } else {
+        scanForRows(node);
+        // The added node may be content *inside* an already-existing row
+        // (Gmail rewriting a cell in place) rather than a new row itself.
+        // querySelectorAll only looks at descendants, so also check
+        // upward for an ancestor row that needs re-verifying.
+        const ancestorRow = node.closest?.(ROW_SELECTOR);
+        if (ancestorRow) classifyRow(ancestorRow);
+      }
 
-    if (summaryCache.has(threadId)) {
-      sendResponse({ ok: true, result: summaryCache.get(threadId) });
-      return;
+      // Thread view: catch a message body that IS the added node itself,
+      // not just one nested inside it.
+      if (node.matches?.(SUMMARY_BODY_SELECTOR)) {
+        summarizeOpenBody(node);
+      } else {
+        scanForOpenBodies(node);
+      }
     }
-
-    try {
-      const res = await fetch(SUMMARY_BACKEND_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
-      });
-      if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-      const data = await res.json(); // Real shape from /api/summary: { summary }
-      summaryCache.set(threadId, data);
-      persistSummaryCache();
-      sendResponse({ ok: true, result: data });
-    } catch (err) {
-      sendResponse({ ok: false, error: err.message });
-    }
-  })();
-
-  // Required: keep the message channel open for the async response above.
-  return true;
+  }
 });
+
+observer.observe(document.body, { childList: true, subtree: true });
+
+// Safety net: rows that failed (server briefly unreachable, etc.) get
+// unmarked but nothing guarantees a DOM mutation touches them again. Sweep
+// periodically to catch and retry those.
+const sweepIntervalId = setInterval(() => scanForRows(), 5000);
+
+// Gmail is a single-page app: switching from one open thread to another
+// changes location.hash without necessarily firing a childList mutation
+// on the body itself (React may just swap innerText/props in place). The
+// periodic sweep below re-checks in case the observer missed it, and this
+// hashchange listener catches it immediately for a snappier feel.
+window.addEventListener("hashchange", () => scanForOpenBodies());
+setInterval(() => scanForOpenBodies(), 3000);

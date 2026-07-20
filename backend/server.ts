@@ -5,9 +5,18 @@ import { GoogleGenAI, Type } from "@google/genai";
 import "dotenv/config";
 import session from "express-session";
 import { google } from "googleapis";
+import crypto from "crypto";
 
 const app = express();
 const PORT = 3000;
+
+// Google deprecates Gemini model IDs on a rolling basis (gemini-2.5-flash-lite
+// was retired without much notice — a 404 "no longer available to new users"
+// is what that looks like). Keeping the model name in ONE place means the
+// next deprecation is a one-line fix instead of a grep-and-replace across
+// every endpoint. gemini-3.1-flash-lite is Google's current recommended
+// replacement for the flash-lite tier as of mid-2026.
+const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 app.use(express.json({ limit: "10mb" }));
 app.use(
@@ -581,7 +590,7 @@ app.post("/api/triage", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: GEMINI_MODEL,
       contents: `Classify the following email body:\n\n"${body}"`,
       config: {
         systemInstruction: "You are a professional email classifier. You must categorize emails according to urgency and core topic.",
@@ -623,10 +632,61 @@ app.post("/api/triage", async (req, res) => {
 });
 
 // 2. Summary Endpoint
+// Server-side summary cache, keyed by a hash of the NORMALIZED body text.
+// The extension (content.js, in real gmail.com) and the app (App.tsx) each
+// call this endpoint independently for the same email, and Gemini isn't
+// deterministic — two separate calls for identical text can come back
+// worded differently, which is exactly why the two surfaces were showing
+// mismatched summaries.
+//
+// A gmailId-based cache key was the first instinct, but the extension's
+// threadId (scraped from Gmail's URL hash permalink) and the app's gmailId
+// (the raw Gmail API message id) are two different ID formats that don't
+// reliably match each other — keying on them would make the cache quietly
+// fail to unify anything. Hashing the actual body text instead sidesteps
+// that mismatch entirely: whichever client asks first generates the
+// summary, and any other client sending the same underlying content gets
+// back that exact same cached text.
+const summaryCacheByHash = new Map<string, { summary: string; source: string; reason?: string }>();
+const MAX_SUMMARY_CACHE_ENTRIES = 2000;
+
+function normalizedBodyHash(body: string): string {
+  // Collapse all whitespace and lowercase, then hash only the first ~400
+  // characters. The extension (DOM-scraped) and the app (Gmail API plain-
+  // text extraction) usually agree closely on the OPENING of an email, but
+  // can diverge further down — quoted thread history, signature blocks, or
+  // HTML-to-text conversion quirks. Truncating first maximizes the chance
+  // both sources land on the same hash for the same real email, while 400
+  // characters of matching text is still specific enough that two
+  // genuinely different emails won't collide.
+  const normalized = body.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 400);
+  return crypto.createHash("sha256").update(normalized).digest("hex");
+}
+
+function cacheSummary(key: string, value: { summary: string; source: string; reason?: string }) {
+  // Only cache real AI output — never let a degraded fallback get "stuck"
+  // as the permanent answer for that email once the underlying issue
+  // (quota, model, etc.) is fixed.
+  if (value.source !== "ai") return;
+  summaryCacheByHash.set(key, value);
+  if (summaryCacheByHash.size > MAX_SUMMARY_CACHE_ENTRIES) {
+    const oldestKey = summaryCacheByHash.keys().next().value;
+    if (oldestKey !== undefined) summaryCacheByHash.delete(oldestKey);
+  }
+}
+
 app.post("/api/summary", async (req, res) => {
-  const { body } = req.body;
+  const { body, gmailId } = req.body;
   if (!body) {
     return res.status(400).json({ error: "Email body is required" });
+  }
+
+  // gmailId is accepted (and logged) for debugging/observability, but the
+  // actual cache key is the body hash — see the comment above for why.
+  const cacheKey = normalizedBodyHash(body);
+
+  if (summaryCacheByHash.has(cacheKey)) {
+    return res.json(summaryCacheByHash.get(cacheKey));
   }
 
   try {
@@ -634,7 +694,7 @@ app.post("/api/summary", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: GEMINI_MODEL,
       contents: `Summarize the following email in a single, short sentence under 20 words, suitable for a mobile notification. Do not write any introduction, quotes, or markdown. Return only the summary text.\n\nEmail body:\n"${body}"`,
     });
 
@@ -643,16 +703,18 @@ app.post("/api/summary", async (req, res) => {
     // this is STILL a fallback from the client's point of view — flag it
     // as such rather than reporting source: "ai" for text that never
     // actually came from the model.
-    res.json(
-      aiText
-        ? { summary: aiText, source: "ai" }
-        : { summary: fallbackSummary(body), source: "fallback", reason: "empty_ai_response" }
-    );
+    const result = aiText
+      ? { summary: aiText, source: "ai" }
+      : { summary: fallbackSummary(body), source: "fallback", reason: "empty_ai_response" };
+
+    cacheSummary(cacheKey, result);
+    res.json(result);
   } catch (error: any) {
     console.error("[AI] Summary endpoint error:", {
       message: error?.message,
       status: error?.status ?? error?.response?.status,
       code: error?.code,
+      gmailId,
     });
     console.log("[AI] Summary endpoint: Using local fallback summary.");
     // Surface WHY it's degraded (quota vs. missing key vs. something else)
@@ -665,6 +727,7 @@ app.post("/api/summary", async (req, res) => {
         : !apiKey
         ? "missing_api_key"
         : "ai_error";
+    // Not cached — a fallback should never permanently stick.
     res.json({ summary: fallbackSummary(body), source: "fallback", reason });
   }
 });
@@ -681,7 +744,7 @@ app.post("/api/extract-criteria", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: GEMINI_MODEL,
       contents: `Read the following text extracted from a document (like a CV, job offer, or criteria sheet) and summarize the core requirements into a concise baseline description of 1 to 3 sentences suitable for checking candidate emails against. Return only the extracted description, without any preambles, formatting, or markdown.\n\nDocument text:\n"${fileText}"`,
     });
 
@@ -719,7 +782,7 @@ For each email, evaluate:
 Return a JSON object containing an array of evaluations.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: GEMINI_MODEL,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -790,7 +853,7 @@ DRAFTING & COMMUNICATION RULES:
     }));
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: GEMINI_MODEL,
       contents: contents,
       config: {
         systemInstruction,

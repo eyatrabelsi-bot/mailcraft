@@ -29,7 +29,8 @@ import {
   Minimize2,
   Menu,
   History,
-  Copy
+  Copy,
+  LogOut
 } from "lucide-react";
 
 // Types for the application
@@ -249,6 +250,12 @@ export default function App() {
   
   // Connection and Activation States
   const [connected, setConnected] = useState<boolean>(false);
+  // The actually-authenticated Google account (from /api/auth/status), so the
+  // avatar/name shown in the UI matches whichever account's inbox is really
+  // loaded — instead of the "evadorra5@gmail.com" placeholder that used to be
+  // hardcoded regardless of who was really signed in.
+  const [googleEmail, setGoogleEmail] = useState<string | null>(null);
+  const [googleName, setGoogleName] = useState<string | null>(null);
   const [activated, setActivated] = useState<boolean>(false);
   const [isClassifying, setIsClassifying] = useState<boolean>(false);
   const [showMatchingOverlay, setShowMatchingOverlay] = useState<boolean>(false);
@@ -394,6 +401,25 @@ export default function App() {
     window.location.href = "/api/auth/google";
   };
 
+  // Calls the backend logout route (destroys the session server-side),
+  // then resets every piece of local state that depended on being
+  // connected — otherwise stale emails/account info would keep showing
+  // even though the session is gone.
+  const handleDisconnectGoogle = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } catch (err) {
+      console.error("Logout request failed:", err);
+    } finally {
+      setConnected(false);
+      setActivated(false);
+      setGoogleEmail(null);
+      setGoogleName(null);
+      setEmails(DEFAULT_EMAILS);
+      showToast("Déconnecté de Google. Vos emails réels ne sont plus affichés.");
+    }
+  };
+
   const fetchRealInbox = async () => {
     try {
       const res = await fetch("/api/gmail/inbox");
@@ -443,6 +469,8 @@ export default function App() {
         const data = await res.json();
         if (data.connected) {
           setConnected(true);
+          setGoogleEmail(data.email || null);
+          setGoogleName(data.name || null);
           fetchRealInbox();
           // Clean the ?auth_success=true param from the URL bar
           window.history.replaceState({}, "", "/");
@@ -895,7 +923,7 @@ export default function App() {
     : filteredEmails.filter(e => !sentEmailIds.includes(e.id));
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans select-none antialiased">
+    <div className="h-screen bg-slate-900 text-slate-100 flex flex-col font-sans select-none antialiased overflow-hidden">
       {/* Toast Notification */}
       {successToast && (
         <div className="fixed bottom-6 left-6 z-50 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-3.5 rounded-xl shadow-2xl border border-emerald-500 flex items-center gap-3 animate-bounce">
@@ -1102,17 +1130,31 @@ export default function App() {
                   <Plus size={12} /> Connecter avec Google
                 </button>
               ) : (
-                <div className="flex items-center gap-2.5 p-1">
-                  <div className="w-7 h-7 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-xs font-extrabold shadow-sm shrink-0">
-                    G
+                <div className="flex flex-col gap-2.5">
+                  <div className="flex items-center gap-2.5 p-1">
+                    <div className="w-7 h-7 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-xs font-extrabold shadow-sm shrink-0">
+                      {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
+                    </div>
+                    <div className="truncate flex-1">
+                      <p className="text-[10px] font-bold text-slate-200 truncate">
+                        {googleName || googleEmail || "Compte Google"}
+                      </p>
+                      {googleName && googleEmail ? (
+                        <p className="text-[9px] text-slate-500 truncate">{googleEmail}</p>
+                      ) : (
+                        <p className="text-[9px] text-emerald-400 font-semibold flex items-center gap-1">
+                          <span className="w-1 h-1 rounded-full bg-emerald-400 animate-ping" />
+                          Services actifs
+                        </p>
+                      )}
+                    </div>
                   </div>
-                  <div className="truncate flex-1">
-                    <p className="text-[10px] font-bold text-slate-200 truncate">Utilisateur Google</p>
-                    <p className="text-[9px] text-emerald-400 font-semibold flex items-center gap-1">
-                      <span className="w-1 h-1 rounded-full bg-emerald-400 animate-ping" />
-                      Services actifs
-                    </p>
-                  </div>
+                  <button
+                    onClick={handleDisconnectGoogle}
+                    className="w-full flex items-center justify-center gap-1.5 text-[10px] font-semibold text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-slate-800/80 hover:border-rose-500/20 rounded-xl py-2 px-3 transition-all cursor-pointer"
+                  >
+                    <LogOut size={12} /> Déconnecter
+                  </button>
                 </div>
               )}
             </div>
@@ -1392,7 +1434,7 @@ export default function App() {
                 <div className="flex-1 flex flex-col bg-slate-900 border-r border-slate-800">
           
           {/* Mock Gmail Top Header / Toolbar styled like real Gmail */}
-          <div className="bg-slate-950/90 border-b border-slate-800/80 px-6 py-2.5 flex items-center justify-between gap-4 shrink-0">
+          <div className="bg-slate-950/90 border-b border-slate-800/80 px-4 md:px-6 py-2.5 flex items-center justify-between gap-4 shrink-0">
             {/* Left Brand Panel */}
             <div className="flex items-center gap-3">
               <button className="text-slate-400 hover:text-slate-200 transition-colors p-1.5 rounded-full hover:bg-slate-800" title="Menu principal">
@@ -1428,14 +1470,14 @@ export default function App() {
             {/* Right Interactive Controls */}
             <div className="flex items-center gap-3">
               {/* Help Circle */}
-              <button className="text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Aide">
+              <button className="hidden sm:inline-flex text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Aide">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </button>
 
               {/* Settings Gear */}
-              <button className="text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Paramètres">
+              <button className="hidden sm:inline-flex text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Paramètres">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
@@ -1474,24 +1516,26 @@ export default function App() {
               {/* Sky Blue Google Workspace Upgrade Button */}
               <button 
                 onClick={() => setShowUpgradeModal(true)}
-                className="bg-sky-400 hover:bg-sky-300 text-sky-950 text-[10px] font-extrabold uppercase tracking-wide px-3 py-1.5 rounded-full transition-all cursor-pointer"
+                className="hidden sm:inline-flex bg-sky-400 hover:bg-sky-300 text-sky-950 text-[10px] font-extrabold uppercase tracking-wide px-3 py-1.5 rounded-full transition-all cursor-pointer"
               >
                 Upgrade
               </button>
 
               {/* 3x3 Apps Grid */}
-              <button className="text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Google apps">
+              <button className="hidden sm:inline-flex text-slate-400 hover:text-slate-200 p-1.5 rounded-full hover:bg-slate-800/60 transition-colors" title="Google apps">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
                 </svg>
               </button>
 
-              {/* Deep Teal Profile Badge with letter "E" (from evadorra5@gmail.com) */}
-              <div 
+              {/* Deep Teal Profile Badge — shows the real connected account's
+                  initial and email instead of a hardcoded placeholder, so it
+                  always matches whichever inbox is actually loaded below. */}
+              <div
                 className="w-7 h-7 rounded-full bg-[#005c53] border border-emerald-500/20 flex items-center justify-center text-white text-xs font-bold shadow-sm cursor-pointer hover:opacity-90"
-                title="evadorra5@gmail.com"
+                title={googleEmail || "Compte Google"}
               >
-                E
+                {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
               </div>
             </div>
           </div>
@@ -1584,8 +1628,8 @@ export default function App() {
               
               {currentMail ? (
                 /* Detail email View */
-                <div className="p-6 flex flex-col h-full">
-                  <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+                <div className="p-4 sm:p-6 flex flex-col h-full">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-800 gap-3">
                     <button
                       onClick={() => setCurrentMail(null)}
                       className="flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300 transition-all font-semibold cursor-pointer"
@@ -1724,7 +1768,7 @@ export default function App() {
                             <span className="text-[10px] text-slate-500">{mail.date}</span>
                           </div>
 
-                          <div className="flex items-center justify-between gap-3">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-3">
                             <h3 className={`text-xs truncate ${!mail.read ? "font-bold text-white" : "text-slate-300"}`}>
                               {mail.subject}
                             </h3>
@@ -2555,7 +2599,7 @@ La Direction`,
             </div>
 
             {/* Modal Body Content */}
-            <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
+            <div className="flex-1 flex flex-col md:flex-row overflow-y-auto md:overflow-hidden">
               {/* Left Side: Configuration Panel */}
               <div className="w-full md:w-[380px] p-5 border-r border-slate-800 overflow-y-auto bg-slate-950/30 flex flex-col gap-4">
                 <div>
@@ -2742,7 +2786,7 @@ La Direction`,
               </div>
 
               {/* Right Side: Scan Results Workspace */}
-              <div className="flex-1 p-5 overflow-y-auto flex flex-col gap-4">
+              <div className="flex-1 p-5 overflow-y-visible md:overflow-y-auto flex flex-col gap-4">
                 <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
                   <h4 className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
                     🎯 Résultats d'évaluation et de Triage
