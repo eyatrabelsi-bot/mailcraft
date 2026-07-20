@@ -547,9 +547,9 @@ export default function App() {
       if (email.urgency) continue;
 
       const triageCacheKey = "triage:" + email.id;
-      const cachedTriage = getAiCache<{ urgency: string; tag: string }>(triageCacheKey);
+      const cachedTriage = getAiCache<{ urgency: "Important" | "Medium" | "Faible"; tag: string }>(triageCacheKey);
 
-      let result: { urgency: string; tag: string } | null = cachedTriage;
+      let result: { urgency: "Important" | "Medium" | "Faible"; tag: string } | null = cachedTriage;
 
       if (!result) {
         try {
