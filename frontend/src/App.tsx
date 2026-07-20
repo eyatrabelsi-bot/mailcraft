@@ -84,6 +84,57 @@ function summaryLabel(email: Pick<Email, "summary" | "summarySource" | "summaryR
   return `⚠️ Résumé indisponible (${reason}) — aperçu : ${email.summary}`;
 }
 
+// --- AI request throttling & caching ---------------------------------------
+// The Gemini free tier caps out at ~10 requests/minute. Without any pacing,
+// summarizeAll() and triggerTriage() below each loop through every email and
+// fire one fetch right after another with no delay — that alone blows
+// through the quota in seconds once you have more than a handful of emails,
+// independent of whatever the actual daily/monthly quota situation is.
+// This serializes every AI call (summary + triage together, since they hit
+// the same underlying model/quota) through one queue spaced safely under
+// the limit, and caches results per email so reloading the page or
+// re-triaging doesn't re-ask for something already known.
+const AI_MIN_INTERVAL_MS = 6500; // ~9.2 req/min combined — comfortable margin under 10/min
+let aiQueue: Promise<unknown> = Promise.resolve();
+let lastAiCallAt = 0;
+
+function throttledAiFetch(url: string, body: unknown): Promise<Response> {
+  const run = aiQueue.then(async () => {
+    const wait = Math.max(0, AI_MIN_INTERVAL_MS - (Date.now() - lastAiCallAt));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastAiCallAt = Date.now();
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  });
+  // Swallow errors on the queue chain itself so one failed call doesn't
+  // permanently stall every AI request queued after it.
+  aiQueue = run.catch(() => undefined);
+  return run;
+}
+
+const AI_CACHE_PREFIX = "mailcraft_ai_cache_v1_";
+
+function getAiCache<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(AI_CACHE_PREFIX + key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setAiCache(key: string, value: unknown) {
+  try {
+    localStorage.setItem(AI_CACHE_PREFIX + key, JSON.stringify(value));
+  } catch {
+    // localStorage full or unavailable — non-fatal, just skip caching this one
+  }
+}
+// -----------------------------------------------------------------------
+
 const DEFAULT_EMAILS: Email[] = [
   {
     id: 1,
@@ -434,12 +485,20 @@ export default function App() {
       const updated = [...emails];
       for (let i = 0; i < updated.length; i++) {
         if (!updated[i].summary) {
+          const cacheKey = "summary:" + updated[i].id;
+          const cached = getAiCache<{ summary: string; source: string; reason?: string }>(cacheKey);
+          if (cached) {
+            updated[i] = {
+              ...updated[i],
+              summary: cached.summary,
+              summarySource: cached.source === "ai" ? "ai" : "fallback",
+              summaryReason: cached.source === "ai" ? undefined : cached.reason,
+            };
+            changed = true;
+            continue;
+          }
           try {
-            const res = await fetch("/api/summary", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ body: updated[i].body })
-            });
+            const res = await throttledAiFetch("/api/summary", { body: updated[i].body });
             if (res.ok) {
               const data = await res.json();
               if (data.summary) {
@@ -449,6 +508,10 @@ export default function App() {
                   summarySource: data.source === "ai" ? "ai" : "fallback",
                   summaryReason: data.source === "ai" ? undefined : data.reason,
                 };
+                // Only cache real AI results — caching a fallback would
+                // permanently lock that email to the degraded summary
+                // even after the quota/model issue is fixed.
+                if (data.source === "ai") setAiCache(cacheKey, data);
                 changed = true;
               }
             }
@@ -483,52 +546,68 @@ export default function App() {
       // Skip if already triaged
       if (email.urgency) continue;
 
-      try {
-        const response = await fetch("/api/triage", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: email.body }),
-        });
-        
-        if (response.ok) {
-          const result = await response.json();
-          email.urgency = result.urgency;
-          email.tag = result.tag;
+      const triageCacheKey = "triage:" + email.id;
+      const cachedTriage = getAiCache<{ urgency: string; tag: string }>(triageCacheKey);
 
-          // If the email is classified as "Important", trigger AI Summary and a persistent notification
-          if (result.urgency === "Important") {
-            const sumResponse = await fetch("/api/summary", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ body: email.body }),
-            });
-            
-            if (sumResponse.ok) {
-              const sumResult = await sumResponse.json();
-              email.summary = sumResult.summary;
-              email.summarySource = sumResult.source === "ai" ? "ai" : "fallback";
-              email.summaryReason = sumResult.source === "ai" ? undefined : sumResult.reason;
-              
-              // Trigger persistent notification if it's not already shown
-              setNotifications(prev => {
-                if (prev.some(n => n.id === email.id)) return prev;
-                return [...prev, email];
-              });
+      let result: { urgency: string; tag: string } | null = cachedTriage;
 
-              // Add to notifiedEmailIds so it displays in the inbox
-              setNotifiedEmailIds(prev => {
-                if (prev.includes(email.id)) return prev;
-                return [...prev, email.id];
-              });
-            }
+      if (!result) {
+        try {
+          const response = await throttledAiFetch("/api/triage", { body: email.body });
+          if (response.ok) {
+            result = await response.json();
+            setAiCache(triageCacheKey, result);
           }
-          
-          // Force state update to show progress live
-          setEmails([...updatedEmails]);
+        } catch (err) {
+          console.log("Unable to classify email, using rule-based fallback.");
         }
-      } catch (err) {
-        console.log("Unable to classify email, using rule-based fallback.");
       }
+
+      if (!result) continue;
+
+      email.urgency = result.urgency;
+      email.tag = result.tag;
+
+      // If the email is classified as "Important", trigger AI Summary and a persistent notification
+      if (result.urgency === "Important" && !email.summary) {
+        const summaryCacheKey = "summary:" + email.id;
+        const cachedSummary = getAiCache<{ summary: string; source: string; reason?: string }>(summaryCacheKey);
+
+        let sumResult: { summary: string; source: string; reason?: string } | null = cachedSummary;
+
+        if (!sumResult) {
+          try {
+            const sumResponse = await throttledAiFetch("/api/summary", { body: email.body });
+            if (sumResponse.ok) {
+              sumResult = await sumResponse.json();
+              if (sumResult && sumResult.source === "ai") setAiCache(summaryCacheKey, sumResult);
+            }
+          } catch (err) {
+            console.log("Unable to summarize email " + email.id + ".");
+          }
+        }
+
+        if (sumResult) {
+          email.summary = sumResult.summary;
+          email.summarySource = sumResult.source === "ai" ? "ai" : "fallback";
+          email.summaryReason = sumResult.source === "ai" ? undefined : sumResult.reason;
+
+          // Trigger persistent notification if it's not already shown
+          setNotifications(prev => {
+            if (prev.some(n => n.id === email.id)) return prev;
+            return [...prev, email];
+          });
+
+          // Add to notifiedEmailIds so it displays in the inbox
+          setNotifiedEmailIds(prev => {
+            if (prev.includes(email.id)) return prev;
+            return [...prev, email.id];
+          });
+        }
+      }
+
+      // Force state update to show progress live
+      setEmails([...updatedEmails]);
     }
     setIsClassifying(false);
   };
