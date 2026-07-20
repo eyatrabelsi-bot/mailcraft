@@ -271,6 +271,22 @@ export default function App() {
   const [mainTab, setMainTab] = useState<"assistant" | "inbox">("assistant");
   const [mainSidebarOpen, setMainSidebarOpen] = useState<boolean>(true);
 
+  // Adjust sidebars automatically based on window size
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 1024) {
+        setSidebarOpen(false); // Collapses right AI panel
+      }
+      if (window.innerWidth < 768) {
+        setMainSidebarOpen(false); // Collapses main left navigation
+      }
+    };
+    // Run once on mount
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   // Chat Assistant State
   const [chatMessages, setChatMessages] = useState<Array<{ role: "user" | "assistant"; content: string }>>([
     {
@@ -932,30 +948,30 @@ export default function App() {
       )}
 
       {/* Top Application Header / Masthead */}
-      <header className="bg-slate-950 border-b border-slate-800 px-6 py-4 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
+      <header className="bg-slate-950 border-b border-slate-800 px-4 md:px-6 py-3.5 md:py-4 flex flex-col sm:flex-row sm:items-center justify-between shrink-0 gap-3">
+        <div className="flex items-center gap-2.5">
           {/* Main Sidebar Toggle Button */}
           <button
             onClick={() => setMainSidebarOpen(!mainSidebarOpen)}
-            className="text-slate-400 hover:text-slate-200 transition-colors cursor-pointer p-2 -ml-2 rounded-lg hover:bg-slate-900"
+            className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-slate-100 transition-colors border border-slate-800/80"
             title={mainSidebarOpen ? "Masquer la barre latérale" : "Afficher la barre latérale"}
           >
             <Menu size={16} />
           </button>
           
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-            <Sparkles size={18} className="text-white" />
+          <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 shrink-0">
+            <Sparkles size={16} className="text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-indigo-300 via-purple-300 to-indigo-100 bg-clip-text text-transparent">
+            <h1 className="text-base md:text-lg font-bold tracking-tight bg-gradient-to-r from-indigo-300 via-purple-300 to-indigo-100 bg-clip-text text-transparent">
               MailCraft AI
             </h1>
-            <p className="text-slate-400 text-[10px] uppercase tracking-wider font-semibold">Triage & Correspondance Gmail</p>
+            <p className="text-slate-400 text-[9px] md:text-[10px] uppercase tracking-wider font-semibold hidden min-[380px]:block">Triage & Correspondance Gmail</p>
           </div>
         </div>
 
         {/* Global Connection Controls */}
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-4 justify-end">
           {!connected ? (
             <button
               onClick={handleConnectGoogle}
@@ -996,7 +1012,13 @@ export default function App() {
         
         {/* 1. Main Navigation Sidebar on Left */}
         {mainSidebarOpen && (
-          <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
+          <>
+            {/* Backdrop for left navigation sidebar on mobile/tablet */}
+            <div
+              className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-40 md:hidden"
+              onClick={() => setMainSidebarOpen(false)}
+            />
+            <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0 max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 shadow-2xl transition-all duration-300 h-full">
             <div className="flex-1 p-3.5 flex flex-col gap-1.5 overflow-y-auto">
               <span className="text-[10px] uppercase font-bold tracking-wider text-slate-500 px-3.5 block mb-2">Navigation</span>
               
@@ -1095,6 +1117,7 @@ export default function App() {
               )}
             </div>
           </aside>
+          </>
         )}
 
         {/* 2. Main content tab area */}
@@ -1473,10 +1496,43 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex-1 flex overflow-hidden">
-            
-            {/* Sidebar Folder Navigation */}
-            <div className="w-56 bg-slate-950/20 p-4 border-r border-slate-800/40 flex flex-col gap-1.5">
+          <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+
+            {/* Mobile Folder Navigation Pills (Visible only on mobile/tablet) */}
+            <div className="lg:hidden shrink-0 flex items-center gap-2 px-4 py-3 bg-slate-950/40 border-b border-slate-800/60 overflow-x-auto w-full">
+              <button
+                onClick={() => { setActiveFolder("inbox"); setCurrentMail(null); }}
+                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all shrink-0 ${activeFolder === "inbox" ? "bg-slate-800 text-white border border-slate-700/60 shadow-md" : "text-slate-400 hover:text-slate-200"}`}
+              >
+                <Mail size={13} />
+                <span>Boîte de réception</span>
+                <span className="bg-slate-950/50 text-[9.5px] px-1.5 py-0.5 rounded-full font-bold border border-slate-800/40 text-slate-300">
+                  {emails.filter(e => notifiedEmailIds.includes(e.id)).length}
+                </span>
+              </button>
+              <button
+                onClick={() => { setActiveFolder("sent"); setCurrentMail(null); }}
+                className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all shrink-0 ${activeFolder === "sent" ? "bg-slate-800 text-white border border-slate-700/60 shadow-md" : "text-slate-400 hover:text-slate-200"}`}
+              >
+                <SendHorizontal size={13} />
+                <span>Messages envoyés</span>
+                {sentEmails.length > 0 && (
+                  <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[9.5px] px-1.5 py-0.5 rounded-full font-bold">
+                    {sentEmails.length}
+                  </span>
+                )}
+              </button>
+
+              {isClassifying && (
+                <div className="ml-auto flex items-center gap-1.5 text-[9.5px] font-bold text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-1 rounded-full shrink-0 animate-pulse">
+                  <RefreshCw size={10} className="animate-spin" />
+                  Tri IA...
+                </div>
+              )}
+            </div>
+
+            {/* Sidebar Folder Navigation (desktop only — mobile uses the pills above) */}
+            <div className="hidden lg:flex w-56 bg-slate-950/20 p-4 border-r border-slate-800/40 flex-col gap-1.5 shrink-0">
               <button
                 onClick={() => { setActiveFolder("inbox"); setCurrentMail(null); }}
                 className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all ${activeFolder === "inbox" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/40"}`}
@@ -1555,12 +1611,12 @@ export default function App() {
                   </div>
 
                   <div className="mt-5">
-                    <div className="flex items-start justify-between">
+                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                       <div>
-                        <h2 className="text-base font-bold text-slate-100">{currentMail.subject}</h2>
+                        <h2 className="text-base font-bold text-slate-100 leading-snug">{currentMail.subject}</h2>
                         <p className="text-xs text-slate-400 mt-1">De : <span className="text-slate-300 font-medium">{currentMail.from}</span></p>
                       </div>
-                      <span className="text-xs text-slate-500">{currentMail.date}</span>
+                      <span className="text-xs text-slate-500 shrink-0">{currentMail.date}</span>
                     </div>
 
                     {currentMail.summary && (
@@ -1716,9 +1772,20 @@ export default function App() {
 
         </div>
 
+        {/* Backdrop for responsive right AI toolbar on mobile/tablet */}
+        {sidebarOpen && (
+          <div
+            className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-30 lg:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
         {/* RIGHT: MailCraft AI Toolbar Extension Side Panel */}
-        <aside 
-          className={`bg-slate-950 border-l border-slate-800 flex flex-col transition-all duration-300 ${sidebarOpen ? "w-[500px]" : "w-12"}`}
+        <aside
+          className={`bg-slate-950 border-l border-slate-800 flex flex-col transition-all duration-300 z-40 ${
+            sidebarOpen
+              ? "fixed right-0 top-0 bottom-0 w-full sm:max-w-[450px] lg:relative lg:w-[500px] h-full shadow-2xl lg:shadow-none"
+              : "hidden lg:flex lg:w-12 lg:relative"
+          }`}
         >
           {/* Collapsed side ribbon showing shortcut icon */}
           {!sidebarOpen ? (
