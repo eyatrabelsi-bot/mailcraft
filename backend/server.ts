@@ -581,7 +581,7 @@ app.post("/api/triage", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.1-flash-lite",
       contents: `Classify the following email body:\n\n"${body}"`,
       config: {
         systemInstruction: "You are a professional email classifier. You must categorize emails according to urgency and core topic.",
@@ -634,7 +634,7 @@ app.post("/api/summary", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.1-flash-lite",
       contents: `Summarize the following email in a single, short sentence under 20 words, suitable for a mobile notification. Do not write any introduction, quotes, or markdown. Return only the summary text.\n\nEmail body:\n"${body}"`,
     });
 
@@ -681,7 +681,7 @@ app.post("/api/extract-criteria", async (req, res) => {
       throw new Error("API Key is missing. Triggering fallback.");
     }
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.1-flash-lite",
       contents: `Read the following text extracted from a document (like a CV, job offer, or criteria sheet) and summarize the core requirements into a concise baseline description of 1 to 3 sentences suitable for checking candidate emails against. Return only the extracted description, without any preambles, formatting, or markdown.\n\nDocument text:\n"${fileText}"`,
     });
 
@@ -719,7 +719,7 @@ For each email, evaluate:
 Return a JSON object containing an array of evaluations.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.1-flash-lite",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -790,7 +790,7 @@ DRAFTING & COMMUNICATION RULES:
     }));
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.1-flash-lite",
       contents: contents,
       config: {
         systemInstruction,
