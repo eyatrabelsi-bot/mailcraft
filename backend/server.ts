@@ -94,7 +94,10 @@ app.get("/api/auth/status", async (req, res) => {
     oauth2Client.setCredentials(req.session.tokens);
     const oauth2 = google.oauth2({ auth: oauth2Client, version: "v2" });
     const { data } = await oauth2.userinfo.get();
-    res.json({ connected: true, email: data.email, name: data.name });
+    // `picture` is the account's real Google profile photo URL — sent
+    // through so the frontend can render the actual avatar instead of
+    // just a fallback initial letter.
+    res.json({ connected: true, email: data.email, name: data.name, picture: data.picture });
   } catch (error) {
     res.json({ connected: false });
   }

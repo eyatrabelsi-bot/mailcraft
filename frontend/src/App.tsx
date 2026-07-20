@@ -256,6 +256,7 @@ export default function App() {
   // hardcoded regardless of who was really signed in.
   const [googleEmail, setGoogleEmail] = useState<string | null>(null);
   const [googleName, setGoogleName] = useState<string | null>(null);
+  const [googlePicture, setGooglePicture] = useState<string | null>(null);
   const [activated, setActivated] = useState<boolean>(false);
   const [isClassifying, setIsClassifying] = useState<boolean>(false);
   const [showMatchingOverlay, setShowMatchingOverlay] = useState<boolean>(false);
@@ -415,6 +416,7 @@ export default function App() {
       setActivated(false);
       setGoogleEmail(null);
       setGoogleName(null);
+      setGooglePicture(null);
       setEmails(DEFAULT_EMAILS);
       showToast("Déconnecté de Google. Vos emails réels ne sont plus affichés.");
     }
@@ -471,6 +473,7 @@ export default function App() {
           setConnected(true);
           setGoogleEmail(data.email || null);
           setGoogleName(data.name || null);
+          setGooglePicture(data.picture || null);
           fetchRealInbox();
           // Clean the ?auth_success=true param from the URL bar
           window.history.replaceState({}, "", "/");
@@ -1132,9 +1135,19 @@ export default function App() {
               ) : (
                 <div className="flex flex-col gap-2.5">
                   <div className="flex items-center gap-2.5 p-1">
-                    <div className="w-7 h-7 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-xs font-extrabold shadow-sm shrink-0">
-                      {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
-                    </div>
+                    {googlePicture ? (
+                      <img
+                        src={googlePicture}
+                        alt={googleName || googleEmail || "Compte Google"}
+                        referrerPolicy="no-referrer"
+                        onError={() => setGooglePicture(null)}
+                        className="w-7 h-7 rounded-full border border-indigo-500/30 shadow-sm shrink-0 object-cover"
+                      />
+                    ) : (
+                      <div className="w-7 h-7 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-xs font-extrabold shadow-sm shrink-0">
+                        {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
+                      </div>
+                    )}
                     <div className="truncate flex-1">
                       <p className="text-[10px] font-bold text-slate-200 truncate">
                         {googleName || googleEmail || "Compte Google"}
@@ -1528,15 +1541,27 @@ export default function App() {
                 </svg>
               </button>
 
-              {/* Deep Teal Profile Badge — shows the real connected account's
-                  initial and email instead of a hardcoded placeholder, so it
-                  always matches whichever inbox is actually loaded below. */}
-              <div
-                className="w-7 h-7 rounded-full bg-[#005c53] border border-emerald-500/20 flex items-center justify-center text-white text-xs font-bold shadow-sm cursor-pointer hover:opacity-90"
-                title={googleEmail || "Compte Google"}
-              >
-                {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
-              </div>
+              {/* Profile Badge — shows the real connected account's actual
+                  Google profile photo (falls back to an initial letter if
+                  no picture came back or it fails to load), so it always
+                  matches whichever inbox is actually loaded below. */}
+              {googlePicture ? (
+                <img
+                  src={googlePicture}
+                  alt={googleName || googleEmail || "Compte Google"}
+                  title={googleEmail || "Compte Google"}
+                  referrerPolicy="no-referrer"
+                  onError={() => setGooglePicture(null)}
+                  className="w-7 h-7 rounded-full border border-emerald-500/20 shadow-sm cursor-pointer hover:opacity-90 object-cover"
+                />
+              ) : (
+                <div
+                  className="w-7 h-7 rounded-full bg-[#005c53] border border-emerald-500/20 flex items-center justify-center text-white text-xs font-bold shadow-sm cursor-pointer hover:opacity-90"
+                  title={googleEmail || "Compte Google"}
+                >
+                  {(googleName || googleEmail || "?").charAt(0).toUpperCase()}
+                </div>
+              )}
             </div>
           </div>
 
