@@ -227,7 +227,7 @@ export default function Landing() {
             <p className="lead">MailCraft lit chaque e-mail qui arrive, l'étiquette, range les rendez-vous dans votre agenda et répond à votre place quand il le reconnaît — sans que vous ayez à ouvrir Gmail.</p>
             <div className="hero-ctas">
               <Link to="/app" className="btn btn-primary">Ajouter à Chrome — gratuit</Link>
-              <Link to="/app" className="btn btn-ghost">Essayer l'assistant IA gratuitement</Link>
+              <Link to="/assistant" className="btn btn-ghost">Essayer l'assistant IA gratuitement</Link>
             </div>
             <div className="hero-note">Extension Chrome + application Android · connecté à votre compte Gmail · <a href="#tri">voir comment ça trie ↓</a></div>
           </div>
@@ -377,7 +377,7 @@ export default function Landing() {
               <span className="feature-index">ASSISTANT PAR PROMPTS</span>
               <h3>Vous pouvez aussi juste lui demander</h3>
               <p>MailCraft fonctionne aussi comme un assistant conversationnel : "résume mes e-mails de ce matin", "trouve le devis de Dupont", "quand est mon prochain rendez-vous ?". Il ne répond qu'aux questions liées à vos e-mails — le reste, il décline poliment, pour rester concentré sur votre boîte de réception.</p>
-              <Link to="/app" className="btn btn-primary btn-sm" style={{ marginTop: "8px" }}>Essayer l'assistant IA gratuitement</Link>
+              <Link to="/assistant" className="btn btn-primary btn-sm" style={{ marginTop: "8px" }}>Essayer l'assistant IA gratuitement</Link>
             </div>
             <div className="feature-visual">
               <div className="chat-mock">

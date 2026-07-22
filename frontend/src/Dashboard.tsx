@@ -244,7 +244,14 @@ Isabelle Martin`,
   }
 ];
 
-export default function Dashboard() {
+interface DashboardProps {
+  startWithSidebarOpen?: boolean;
+  // When true, hides the "Boîte de réception" preview panel at the bottom
+  // of the dashboard (e.g. for the trial/assistant-only entry point).
+  hideInboxPreview?: boolean;
+}
+
+export default function Dashboard({ startWithSidebarOpen = true , hideInboxPreview = false,}: DashboardProps = {}) {
   const [emails, setEmails] = useState<Email[]>(DEFAULT_EMAILS);
   const [currentMail, setCurrentMail] = useState<Email | null>(null);
   
@@ -277,7 +284,7 @@ export default function Dashboard() {
 
   // New Navigation and Sidebar States
   const [mainTab, setMainTab] = useState<"assistant" | "inbox">("assistant");
-  const [mainSidebarOpen, setMainSidebarOpen] = useState<boolean>(true);
+  const [mainSidebarOpen, setMainSidebarOpen] = useState<boolean>(startWithSidebarOpen);
 
   // Adjust sidebars automatically based on window size
   useEffect(() => {
@@ -1319,7 +1326,7 @@ export default function Dashboard() {
               )}
 
               {/* BOTTOM: Boîte de Réception preview when not connected */}
-              {!connected && (
+              {!connected && !hideInboxPreview && (
                 <div className="bg-slate-950/40 rounded-2xl border border-slate-800/80 p-5 flex flex-col gap-4 shadow-xl">
                   <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
                     <div className="flex items-center gap-2">

@@ -8,6 +8,9 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/app" element={<Dashboard />} />
+        {/* Chat-only entry point (sidebar collapsed, no inbox preview), used by the
+            "Essayer l'assistant IA gratuitement" links on the landing page */}
+        <Route path="/assistant" element={<Dashboard startWithSidebarOpen={false} hideInboxPreview={true} />} />
       </Routes>
     </BrowserRouter>
   );
