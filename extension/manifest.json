@@ -17,6 +17,7 @@
       "https://www.googleapis.com/auth/gmail.readonly"
     ]
   },
+  
 
   "background": {
     "service_worker": "background.js"

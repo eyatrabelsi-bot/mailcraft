@@ -66,9 +66,9 @@ function persistCache() {
 //      "https://gmail.googleapis.com/*"
 // See the manifest.json diff alongside this file.
 
-function getAuthToken() {
+function getAuthToken(interactive = false) {
   return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive: true }, (token) => {
+    chrome.identity.getAuthToken({ interactive }, (token) => {
       if (chrome.runtime.lastError || !token) {
         reject(new Error(chrome.runtime.lastError?.message || "No token"));
         return;
