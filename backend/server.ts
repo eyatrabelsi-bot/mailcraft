@@ -171,6 +171,101 @@ app.get("/api/gmail/inbox", async (req, res) => {
   }
 });
 
+// Helper: find (or create) a Gmail label for a given classification tag.
+// Labels are namespaced under "MailCraft/<tag>" (Gmail renders the "/" as a
+// nested label in the sidebar) so we never collide with the user's own
+// existing labels, and so all auto-created labels are grouped together.
+// A tiny in-memory cache avoids re-listing labels on every single email
+// during a triage batch — it's keyed per Gmail client instance's access
+// token so it can't leak across different logged-in users on the same
+// server process.
+const labelIdCache = new Map<string, string>(); // key: `${accessToken}:${labelName}` -> labelId
+
+function sanitizeLabelName(tag: string): string {
+  // Gmail label names can't contain raw newlines and shouldn't be empty;
+  // keep it short and trim stray whitespace from the AI/fallback tag.
+  const clean = tag.trim().replace(/[\r\n]+/g, " ").slice(0, 40);
+  return clean || "Email";
+}
+
+async function getOrCreateLabelId(
+  gmail: ReturnType<typeof google.gmail>,
+  accessToken: string,
+  tag: string
+): Promise<string> {
+  const labelName = `MailCraft/${sanitizeLabelName(tag)}`;
+  const cacheKey = `${accessToken}:${labelName}`;
+  const cached = labelIdCache.get(cacheKey);
+  if (cached) return cached;
+
+  const list = await gmail.users.labels.list({ userId: "me" });
+  const existing = list.data.labels?.find(
+    (l) => l.name?.toLowerCase() === labelName.toLowerCase()
+  );
+  if (existing?.id) {
+    labelIdCache.set(cacheKey, existing.id);
+    return existing.id;
+  }
+
+  const created = await gmail.users.labels.create({
+    userId: "me",
+    requestBody: {
+      name: labelName,
+      labelListVisibility: "labelShow",
+      messageListVisibility: "show",
+    },
+  });
+  const newId = created.data.id;
+  if (!newId) throw new Error("Gmail did not return an id for the created label");
+  labelIdCache.set(cacheKey, newId);
+  return newId;
+}
+
+// 5b. Create (if needed) the libellé matching a classification tag, and
+// move the given message into it. "Move" here means: apply the label, and
+// optionally remove it from INBOX so it behaves like a folder rather than
+// just an extra tag — controlled by `archive` (defaults to false, i.e. the
+// email keeps showing in the inbox AND gets the label).
+app.post("/api/gmail/apply-label", async (req, res) => {
+  const gmail = getGmailClient(req);
+  if (!gmail) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  const { gmailId, tag, archive } = req.body as {
+    gmailId?: string;
+    tag?: string;
+    archive?: boolean;
+  };
+  if (!gmailId || !tag) {
+    return res.status(400).json({ error: "gmailId and tag are required" });
+  }
+
+  try {
+    const accessToken = req.session.tokens?.access_token || "";
+    const labelId = await getOrCreateLabelId(gmail, accessToken, tag);
+
+    await gmail.users.messages.modify({
+      userId: "me",
+      id: gmailId,
+      requestBody: {
+        addLabelIds: [labelId],
+        removeLabelIds: archive ? ["INBOX"] : [],
+      },
+    });
+
+    res.json({ success: true, labelId, labelName: `MailCraft/${sanitizeLabelName(tag)}` });
+  } catch (error: any) {
+    console.error("Gmail apply-label error:", {
+      message: error?.message,
+      status: error?.status ?? error?.response?.status,
+      gmailId,
+      tag,
+    });
+    res.status(500).json({ error: "Failed to apply label" });
+  }
+});
+
 // 6. Send a real email reply
 app.post("/api/gmail/send", async (req, res) => {
   const gmail = getGmailClient(req);

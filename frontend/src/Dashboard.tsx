@@ -48,6 +48,8 @@ interface Email {
   summaryReason?: string; // e.g. "quota_exceeded", "missing_api_key" — only set when summarySource is "fallback"
   gmailId?: string;   // stores the real Gmail message ID for replying
   isAutoReply?: boolean; // true for synthetic entries representing a sent auto-reply
+  gmailLabelName?: string; // the "MailCraft/<tag>" Gmail label actually applied to this message, once done
+  gmailLabelStatus?: "pending" | "applied" | "error"; // lifecycle of the auto-labeling for this message
 }
 
 interface Baseline {
@@ -135,6 +137,58 @@ function setAiCache(key: string, value: unknown) {
   }
 }
 // -----------------------------------------------------------------------
+
+// Tracks which (gmailId, tag) pairs have already had their Gmail label
+// applied this session, so re-renders / re-runs of triggerTriage() (e.g.
+// after the inbox polls for new mail) don't hammer the Gmail API re-doing
+// work that already succeeded. Kept in localStorage so a page reload
+// doesn't re-apply either — Gmail label creation is idempotent server-side
+// anyway, but there's no reason to make the extra round-trip.
+const LABELED_CACHE_PREFIX = "mailcraft_gmail_labeled_v1_";
+
+function alreadyLabeled(gmailId: string, tag: string): string | null {
+  try {
+    return localStorage.getItem(LABELED_CACHE_PREFIX + gmailId + ":" + tag);
+  } catch {
+    return null;
+  }
+}
+
+function markLabeled(gmailId: string, tag: string, labelName: string) {
+  try {
+    localStorage.setItem(LABELED_CACHE_PREFIX + gmailId + ":" + tag, labelName);
+  } catch {
+    // non-fatal
+  }
+}
+
+// Creates (if needed) the "MailCraft/<tag>" Gmail label and applies it to
+// the real message. Returns the label name on success, or null if it
+// couldn't be applied (not connected to Gmail, request failed, etc.) —
+// callers should treat null as "skip silently", since this always runs
+// alongside the AI classification and shouldn't block or break it.
+async function applyGmailLabel(gmailId: string, tag: string, archive: boolean): Promise<string | null> {
+  const cached = alreadyLabeled(gmailId, tag);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch("/api/gmail/apply-label", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gmailId, tag, archive }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.labelName) {
+      markLabeled(gmailId, tag, data.labelName);
+      return data.labelName as string;
+    }
+    return null;
+  } catch (err) {
+    console.log("Unable to apply Gmail label for message " + gmailId + ".");
+    return null;
+  }
+}
 
 const DEFAULT_EMAILS: Email[] = [
   {
@@ -266,6 +320,17 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
   const [googlePicture, setGooglePicture] = useState<string | null>(null);
   const [activated, setActivated] = useState<boolean>(false);
   const [isClassifying, setIsClassifying] = useState<boolean>(false);
+  // When true, auto-labeling also removes the email from Gmail's INBOX
+  // (a real "move"). When false (default), the libellé is applied but the
+  // email still shows in the inbox too — matches how Gmail labels normally
+  // behave. Persisted so the preference survives a reload.
+  const [archiveAfterLabel, setArchiveAfterLabel] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("mailcraft_archive_after_label") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [showMatchingOverlay, setShowMatchingOverlay] = useState<boolean>(false);
   
   // Persistent Notifications
@@ -621,6 +686,18 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
 
       email.urgency = result.urgency;
       email.tag = result.tag;
+
+      // Auto-create the matching Gmail libellé and file this message under
+      // it. Only real inbox messages (fetched via the Gmail API) have a
+      // gmailId — the simulated/demo emails don't, and there's nothing to
+      // label for those.
+      if (email.gmailId && result.tag) {
+        email.gmailLabelStatus = "pending";
+        setEmails([...updatedEmails]);
+        const labelName = await applyGmailLabel(email.gmailId, result.tag, archiveAfterLabel);
+        email.gmailLabelName = labelName || undefined;
+        email.gmailLabelStatus = labelName ? "applied" : "error";
+      }
 
       // If the email is classified as "Important", trigger AI Summary and a persistent notification
       if (result.urgency === "Important" && !email.summary) {
@@ -1683,6 +1760,16 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                           {currentMail.tag}
                         </span>
                       )}
+                      {currentMail.gmailLabelStatus === "pending" && (
+                        <span className="text-[10px] bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full border border-slate-700/50 font-medium flex items-center gap-1">
+                          <RefreshCw size={10} className="animate-spin" /> Libellé…
+                        </span>
+                      )}
+                      {currentMail.gmailLabelName && (
+                        <span className="text-[10px] bg-emerald-600/20 text-emerald-300 px-2.5 py-1 rounded-full border border-emerald-500/30 font-semibold flex items-center gap-1">
+                          <CheckCircle2 size={10} /> {currentMail.gmailLabelName}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -1823,6 +1910,11 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                                   <span className="text-[9px] bg-slate-800/80 text-indigo-300 px-2 py-0.5 rounded-full border border-slate-700 font-semibold uppercase">
                                     {mail.tag}
                                   </span>
+                                  {mail.gmailLabelName && (
+                                    <span className="text-[9px] bg-emerald-600/15 text-emerald-300 px-2 py-0.5 rounded-full border border-emerald-500/25 font-semibold flex items-center gap-1">
+                                      <CheckCircle2 size={9} /> {mail.gmailLabelName}
+                                    </span>
+                                  )}
                                 </>
                               ) : (
                                 connected && activated && (
@@ -2527,7 +2619,40 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                             <strong className="text-white">Génération automatique de résumé :</strong> Inutile de lire l'intégralité du mail pour comprendre l'action attendue. L'IA génère un condensé de moins de 20 mots.
                           </p>
                         </div>
+                        <div className="flex gap-2 items-start">
+                          <Check size={14} className="text-emerald-400 shrink-0 mt-0.5" />
+                          <p>
+                            <strong className="text-white">Libellés Gmail automatiques :</strong> Pour chaque email réel connecté à votre compte Gmail, MailCraft crée (si besoin) un libellé <code className="bg-slate-800 px-1 rounded text-indigo-300">MailCraft/{"<catégorie>"}</code> correspondant à sa classification et le lui applique directement dans Gmail.
+                          </p>
+                        </div>
                       </div>
+                    </div>
+
+                    {/* Auto-labeling preference */}
+                    <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col gap-3">
+                      <span className="text-[10px] uppercase font-extrabold text-indigo-400 tracking-wider">Rangement automatique des libellés</span>
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={archiveAfterLabel}
+                          onChange={(e) => {
+                            const value = e.target.checked;
+                            setArchiveAfterLabel(value);
+                            try {
+                              localStorage.setItem("mailcraft_archive_after_label", String(value));
+                            } catch {
+                              // non-fatal
+                            }
+                          }}
+                          className="mt-0.5 accent-indigo-500 w-3.5 h-3.5 shrink-0"
+                        />
+                        <span className="text-[11px] text-slate-300 leading-relaxed">
+                          <strong className="text-white">Retirer de la boîte de réception après classement.</strong> Par défaut, le libellé est ajouté mais l'email reste visible dans la boîte de réception. Active cette option pour que chaque mail soit vraiment "déplacé" vers son libellé (comme un classement par dossier), et retiré de l'Inbox Gmail.
+                        </span>
+                      </label>
+                      <p className="text-[10px] text-slate-500 italic">
+                        Ce réglage s'applique uniquement aux prochains emails classés — il ne modifie pas rétroactivement les libellés déjà posés.
+                      </p>
                     </div>
 
                     {/* Simulation Triggers */}
