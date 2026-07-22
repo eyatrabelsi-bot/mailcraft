@@ -193,7 +193,7 @@ async function getOrCreateLabelId(
   accessToken: string,
   tag: string
 ): Promise<string> {
-  const labelName = `MailCraft/${sanitizeLabelName(tag)}`;
+  const labelName = `${sanitizeLabelName(tag)}`;
   const cacheKey = `${accessToken}:${labelName}`;
   const cached = labelIdCache.get(cacheKey);
   if (cached) return cached;
@@ -254,7 +254,7 @@ app.post("/api/gmail/apply-label", async (req, res) => {
       },
     });
 
-    res.json({ success: true, labelId, labelName: `MailCraft/${sanitizeLabelName(tag)}` });
+    res.json({ success: true, labelId, labelName: `${sanitizeLabelName(tag)}` });
   } catch (error: any) {
     console.error("Gmail apply-label error:", {
       message: error?.message,
