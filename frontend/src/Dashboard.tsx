@@ -465,6 +465,12 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
   const [notifiedEmailIds, setNotifiedEmailIds] = useState<number[]>([]);
   const [promptsLeft, setPromptsLeft] = useState<number>(25);
   const [showUpgradeModal, setShowUpgradeModal] = useState<boolean>(false);
+  // Controls the "choose your platform" modal shown from every "Activer le
+  // tri IA" button, instead of activating the demo directly.
+  const [showActivationModal, setShowActivationModal] = useState<boolean>(false);
+  // "platform": Chrome vs Android choice. "chrome-choice": already-installed
+  // vs needs-to-install sub-choice shown after picking "Extension Chrome".
+  const [activationModalStep, setActivationModalStep] = useState<"platform" | "chrome-choice">("platform");
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -897,11 +903,28 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
     }
 
     try {
+      // Only share inbox metadata with the assistant once MailCraft AI is
+      // actually active (extension/app) — before that there's no real
+      // classified mail to answer questions about, and the backend already
+      // knows to say so gracefully when this is omitted/empty.
+      const inboxContext = activated
+        ? emails.map((e) => ({
+            from: e.from,
+            subject: e.subject,
+            date: e.date,
+            urgency: e.urgency,
+            tag: e.tag,
+            summary: e.summary,
+            read: e.read,
+          }))
+        : null;
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: [...chatMessages, userMsg]
+          messages: [...chatMessages, userMsg],
+          inboxContext,
         })
       });
 
@@ -1104,10 +1127,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
               
               {!activated ? (
                 <button
-                  onClick={() => {
-                    setActivated(true);
-                    showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                  }}
+                  onClick={() => setShowActivationModal(true)}
                   className="bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-semibold px-4.5 py-2 rounded-xl transition-all shadow-md flex items-center gap-2 cursor-pointer"
                 >
                   <Sparkles size={14} /> Activer le tri IA
@@ -1972,10 +1992,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
               {/* Activer le tri IA button in the collapsed bar */}
               {!activated ? (
                 <button
-                  onClick={() => {
-                    setActivated(true);
-                    showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                  }}
+                  onClick={() => setShowActivationModal(true)}
                   className="w-8 h-8 rounded-xl bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 border border-purple-500/30 flex items-center justify-center cursor-pointer transition-all animate-pulse"
                   title="Activer le tri IA"
                 >
@@ -2004,10 +2021,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                 <div className="flex items-center gap-3">
                   {!activated ? (
                     <button
-                      onClick={() => {
-                        setActivated(true);
-                        showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                      }}
+                      onClick={() => setShowActivationModal(true)}
                       className="bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all shadow-md flex items-center gap-1.5 cursor-pointer animate-pulse"
                     >
                       <Sparkles size={11} /> Activer le tri IA
@@ -2071,10 +2085,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                         La Boîte MailCraft, le triage par importance, les notifications persistantes et le pilote automatique requièrent l'activation de l'extension MailCraft AI dans votre messagerie.
                       </p>
                       <button
-                        onClick={() => {
-                          setActivated(true);
-                          showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                        }}
+                        onClick={() => setShowActivationModal(true)}
                         className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-5 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer animate-pulse"
                       >
                         <Sparkles size={14} /> Activer le tri IA
@@ -2182,10 +2193,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                         Le Mail Matching et le scan automatique de votre messagerie requièrent l'activation de l'extension MailCraft AI dans votre messagerie.
                       </p>
                       <button
-                        onClick={() => {
-                          setActivated(true);
-                          showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                        }}
+                        onClick={() => setShowActivationModal(true)}
                         className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-5 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer animate-pulse"
                       >
                         <Sparkles size={14} /> Activer le tri IA
@@ -2558,10 +2566,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                         Les statistiques de triage et les configurations avancées requièrent l'activation de l'extension MailCraft AI dans votre messagerie.
                       </p>
                       <button
-                        onClick={() => {
-                          setActivated(true);
-                          showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
-                        }}
+                        onClick={() => setShowActivationModal(true)}
                         className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs px-5 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer animate-pulse"
                       >
                         <Sparkles size={14} /> Activer le tri IA
@@ -3175,6 +3180,137 @@ La Direction`,
                 Plus tard
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 6. ACTIVATION MODAL — choose Chrome extension vs Android app,
+             then (for Chrome) already-installed vs needs-to-install */}
+      {showActivationModal && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 max-w-md w-full shadow-2xl relative overflow-hidden animate-in fade-in zoom-in duration-300">
+            <div className="absolute top-0 right-0 w-36 h-36 bg-indigo-500/10 rounded-full blur-3xl -mr-12 -mt-12 pointer-events-none" />
+
+            {activationModalStep === "chrome-choice" && (
+              <button
+                onClick={() => setActivationModalStep("platform")}
+                className="absolute top-4 left-4 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer text-xs p-1.5 hover:bg-slate-800/40 rounded-full flex items-center gap-1"
+              >
+                <ArrowLeft size={13} />
+              </button>
+            )}
+
+            <button
+              onClick={() => {
+                setShowActivationModal(false);
+                setActivationModalStep("platform");
+              }}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer text-sm p-1.5 hover:bg-slate-800/40 rounded-full"
+            >
+              ✕
+            </button>
+
+            {activationModalStep === "platform" ? (
+              <div className="flex flex-col items-center text-center">
+                <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-white mb-5 shadow-lg shadow-indigo-500/20">
+                  <Sparkles size={28} className="animate-pulse" />
+                </div>
+
+                <h3 className="text-base font-extrabold text-slate-100 uppercase tracking-wider mb-2">
+                  Où voulez-vous activer MailCraft AI ?
+                </h3>
+
+                <div className="h-[1px] w-16 bg-gradient-to-r from-transparent via-indigo-500 to-transparent my-3" />
+
+                <p className="text-xs text-slate-300 leading-relaxed mb-6">
+                  MailCraft AI fonctionne directement dans Gmail via son extension Chrome, ou depuis votre mobile via l'application Android.
+                </p>
+
+                <div className="w-full flex flex-col gap-3">
+                  {/* Extension Chrome — leads to the "already installed / install now" sub-choice */}
+                  <button
+                    onClick={() => setActivationModalStep("chrome-choice")}
+                    className="w-full bg-slate-950/60 hover:bg-slate-950 border border-slate-800 hover:border-indigo-500/40 rounded-2xl p-4 flex items-center gap-3.5 text-left transition-all cursor-pointer group"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center text-lg shrink-0">
+                      🧩
+                    </div>
+                    <div className="flex-1">
+                      <div className="text-xs font-bold text-white">Extension Chrome</div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">Badges et libellés directement dans Gmail</div>
+                    </div>
+                    <ChevronRight size={14} className="text-slate-500 group-hover:text-indigo-400 transition-colors shrink-0" />
+                  </button>
+
+                  {/* Application Android — not published yet, placeholder only */}
+                  <button
+                    onClick={() => {
+                      setShowActivationModal(false);
+                      showToast("Application Android — bientôt disponible 🚀");
+                    }}
+                    className="w-full bg-slate-950/60 hover:bg-slate-950 border border-slate-800 hover:border-purple-500/40 rounded-2xl p-4 flex items-center gap-3.5 text-left transition-all cursor-pointer group"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-purple-500/10 flex items-center justify-center text-lg shrink-0">
+                      🤖
+                    </div>
+                    <div className="flex-1">
+                      <div className="text-xs font-bold text-white flex items-center gap-2">
+                        Application Android
+                        <span className="text-[9px] font-semibold uppercase tracking-wider bg-purple-500/15 text-purple-300 border border-purple-500/25 px-1.5 py-0.5 rounded-full">
+                          Bientôt
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">Triage et notifications sur votre téléphone</div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center text-center">
+                <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-lg mb-5 shadow-lg shadow-indigo-500/20">
+                  🧩
+                </div>
+
+                <h3 className="text-base font-extrabold text-slate-100 uppercase tracking-wider mb-2">
+                  Extension Chrome
+                </h3>
+
+                <div className="h-[1px] w-16 bg-gradient-to-r from-transparent via-indigo-500 to-transparent my-3" />
+
+                <p className="text-xs text-slate-300 leading-relaxed mb-6">
+                  Avez-vous déjà installé l'extension MailCraft AI dans Chrome ?
+                </p>
+
+                <div className="w-full flex flex-col gap-3">
+                  {/* Already installed — the extension itself is doing the real work
+                      (badges + libellés Gmail), so this just reflects that in the UI. */}
+                  <button
+                    onClick={() => {
+                      setActivated(true);
+                      setShowActivationModal(false);
+                      setActivationModalStep("platform");
+                      showToast("MailCraft AI activé ! Début du triage automatique en arrière-plan.");
+                    }}
+                    className="w-full bg-emerald-600/90 hover:bg-emerald-500 text-white font-bold text-xs py-3.5 px-6 rounded-xl shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <CheckCircle2 size={15} /> J'ai déjà l'extension
+                  </button>
+
+                  {/* Not installed yet — send them to the install instructions
+                      section on the landing page. */}
+                  <button
+                    onClick={() => {
+                      setShowActivationModal(false);
+                      setActivationModalStep("platform");
+                      window.location.href = "/#partout";
+                    }}
+                    className="w-full bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs py-3.5 px-6 rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer border border-slate-700"
+                  >
+                    <ExternalLink size={14} /> Installer l'extension
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

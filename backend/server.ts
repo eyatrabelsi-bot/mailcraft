@@ -607,7 +607,76 @@ function fallbackMatchEmails(topic: string, criteria: string, emails: EvaluatedE
   return { results };
 }
 
-function fallbackChat(messages: { role: string; content: string }[]): string {
+// Minimal shape of an email the chat assistant needs to answer questions
+// like "résume mes emails de ce matin" or "what's the most important mail
+// today" — only sent by the frontend once the extension/app is active
+// (see Dashboard.tsx), since that's when real classified mail exists.
+interface ChatInboxEmail {
+  from: string;
+  subject: string;
+  date: string;
+  urgency?: string;
+  tag?: string;
+  summary?: string;
+  read?: boolean;
+}
+
+// Builds a rule-based answer to inbox-related questions (summary, most
+// important mail, counts...) directly from the metadata the frontend sent,
+// without needing the AI model at all. Returns null if the message doesn't
+// actually look like an inbox question, so the caller can fall through to
+// the rest of fallbackChat's matchers.
+function answerInboxQuery(lastMsgLower: string, inboxContext?: ChatInboxEmail[] | null): string | null {
+  const isMailboxQuery =
+    /(résum|summar).*(mail|email|inbox|bo[iî]te)/i.test(lastMsgLower) ||
+    /(mail|email).*(résum|summar)/i.test(lastMsgLower) ||
+    /plus important.*(mail|email)|most important.*(mail|email)|(mail|email).*plus important|(mail|email).*important.*(today|aujourd'hui)/i.test(lastMsgLower) ||
+    /combien.*(mail|email)|how many.*(mail|email)/i.test(lastMsgLower) ||
+    /(mes|my) (mails|emails|inbox)|ma bo[iî]te/i.test(lastMsgLower);
+
+  if (!isMailboxQuery) return null;
+
+  if (!inboxContext || inboxContext.length === 0) {
+    return "Je n'ai pas encore accès à ta boîte de réception ici. Active MailCraft AI (bouton \"Activer le tri IA\" → Extension Chrome ou Application Android) pour que je puisse analyser tes emails en direct et répondre à ce type de question !\n\nI don't have access to your inbox yet here — activate MailCraft AI (the \"Activer le tri IA\" button) via the Chrome extension or Android app so I can read your live emails and answer this kind of question.";
+  }
+
+  const important = inboxContext.filter((e) => e.urgency === "Important");
+  const isEnglish = /how many|what's|most important|summarize|my emails|my inbox/i.test(lastMsgLower);
+
+  // "What's the most important mail" — answer with just those, not a full dump.
+  if (/plus important|most important/i.test(lastMsgLower)) {
+    if (important.length === 0) {
+      return isEnglish
+        ? "Good news — nothing urgent in your inbox right now. No email is currently marked \"Important\"."
+        : "Bonne nouvelle : rien d'urgent dans ta boîte pour le moment. Aucun email n'est actuellement marqué \"Important\".";
+    }
+    const lines = important
+      .slice(0, 5)
+      .map((e) => `- **${e.subject}** (${e.from})${e.summary ? ` — ${e.summary}` : ""}`)
+      .join("\n");
+    return isEnglish
+      ? `Here ${important.length > 1 ? "are" : "is"} the ${important.length} email(s) marked as most important right now:\n\n${lines}`
+      : `Voici ${important.length > 1 ? "les" : "l'"} email(s) marqué(s) le${important.length > 1 ? "s" : ""} plus important${important.length > 1 ? "s" : ""} en ce moment :\n\n${lines}`;
+  }
+
+  // Generic "résume mes emails" / "summarize my inbox" — short digest of everything.
+  const lines = inboxContext
+    .slice(0, 8)
+    .map((e) => `- ${e.subject} (${e.from})${e.tag ? ` — ${e.tag}` : ""}${e.summary ? ` : ${e.summary}` : ""}`)
+    .join("\n");
+  const importantNote =
+    important.length > 0
+      ? isEnglish
+        ? `\n\n📌 ${important.length} of them ${important.length > 1 ? "are" : "is"} marked Important.`
+        : `\n\n📌 ${important.length} d'entre eux ${important.length > 1 ? "sont marqués" : "est marqué"} Important.`
+      : "";
+
+  return isEnglish
+    ? `Here's a quick digest of your inbox (${inboxContext.length} email(s)):\n\n${lines}${importantNote}`
+    : `Voici un résumé rapide de ta boîte de réception (${inboxContext.length} email(s)) :\n\n${lines}${importantNote}`;
+}
+
+function fallbackChat(messages: { role: string; content: string }[], inboxContext?: ChatInboxEmail[] | null): string {
   const lastMsg = messages[messages.length - 1]?.content || "";
   const lastMsgLower = lastMsg.toLowerCase().trim();
 
@@ -617,6 +686,24 @@ function fallbackChat(messages: { role: string; content: string }[]): string {
 
   if (isShortAck) {
     return "De rien ! Je reste toujours disponible à vos côtés dès que vous en avez besoin. / You are welcome! I am always available to assist you whenever you need.";
+  }
+
+  // 1b. Inbox-aware questions ("résume mes emails", "what's most important
+  // today"...) — checked early, and independently of the AI model, so this
+  // always works the instant the extension/app is active, even offline.
+  const inboxAnswer = answerInboxQuery(lastMsgLower, inboxContext);
+  if (inboxAnswer) return inboxAnswer;
+
+  // 1c. Casual small talk / "how are you" — kept separate from the more
+  // formal greeting branch below so a plain "hey" or "ça va ?" gets a
+  // short, natural, human-sounding reply instead of the fuller pitch.
+  const casualGreetings = ["hey", "yo", "coucou", "salut", "sup", "wesh", "ça va", "ca va", "how are you", "how're you", "how are u", "how r u", "comment vas-tu", "comment allez-vous", "quoi de neuf", "what's up", "whats up"];
+  const isCasualGreeting = casualGreetings.some(g => lastMsgLower === g || lastMsgLower.startsWith(g + " ") || lastMsgLower.startsWith(g + "?") || lastMsgLower.startsWith(g + "!") || lastMsgLower === g + "?" || lastMsgLower === g + "!");
+  if (isCasualGreeting) {
+    const isEnglish = /^(hey|yo|sup|how|what)/i.test(lastMsgLower);
+    return isEnglish
+      ? "Hey! I'm doing great, thanks for asking 🙂 What can I help you with — an email to write, your inbox to check, or something else entirely?"
+      : "Hey ! Ça va très bien, merci de demander 🙂 Sur quoi je peux t'aider — un email à rédiger, ta boîte à consulter, ou autre chose ?";
   }
 
   const generalQuestions = ["bonjour", "salut", "hello", "hi", "qui es-tu", "comment ça va", "how are you", "what is your name", "aide", "help"];
@@ -1017,7 +1104,10 @@ Return a JSON object containing an array of evaluations.`;
 
 // 5. Chat Assistant Endpoint
 app.post("/api/chat", async (req, res) => {
-  const { messages } = req.body;
+  const { messages, inboxContext } = req.body as {
+    messages?: { role: string; content: string }[];
+    inboxContext?: ChatInboxEmail[] | null;
+  };
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "messages array is required" });
   }
@@ -1026,9 +1116,22 @@ app.post("/api/chat", async (req, res) => {
     if (!apiKey) {
       throw new Error("API Key is missing. Triggering fallback.");
     }
+    // Only ever true once the extension/app is active on the frontend (see
+    // Dashboard.tsx) — that's the point at which real classified mail
+    // actually exists to answer questions about.
+    const hasInboxContext = Array.isArray(inboxContext) && inboxContext.length > 0;
+    const inboxSection = hasInboxContext
+      ? `\n\nLIVE INBOX ACCESS:
+You currently have access to the user's real, live inbox (provided by the connected Chrome extension or Android app). Here is a JSON snapshot of it — each item has from, subject, date, urgency ("Important" | "Medium" | "Faible"), tag (topic), and summary:
+${JSON.stringify(inboxContext).slice(0, 6000)}
+
+Use this data to directly answer questions like "résume mes emails de ce matin", "what's the most important mail today", "combien d'emails urgents ai-je", etc. Never say you don't have access to the inbox — you do. Keep inbox answers concise (a short digest or a focused list), not a full re-dump of every field.`
+      : `\n\nNO LIVE INBOX ACCESS YET:
+The user has not activated the Chrome extension or Android app yet, so you do NOT have access to their real inbox. If they ask something that requires reading their actual emails (e.g. "résume mes emails", "what's my most important mail today"), tell them briefly (matching their language) that this needs MailCraft AI activated first via the "Activer le tri IA" button (Chrome extension or Android app), rather than making up email content.`;
+
     const systemInstruction = `You are MailCraft AI, a highly specialized, professional, and flexible AI assistant.
 Your primary expertise is writing, reviewing, critiquing, and drafting professional emails, letters of motivation, cover letters, job applications, academic inquiries, and workplace correspondence.
-However, you are extremely flexible! You can help the user with any other request they have (such as explaining general topics, translating, drafting other text, giving creative suggestions, answering random questions, etc.).
+However, you are extremely flexible! You can help the user with any other request they have (such as explaining general topics, translating, drafting other text, giving creative suggestions, answering random questions, etc.). This includes ordinary human small talk — if the user just says something casual like "hey", "how are you", "ça va ?", reply briefly and naturally like a friendly human would, then offer to help, instead of launching into a full capabilities pitch.
 
 STRICT BEHAVIOR AND FLEXIBILITY RULES:
 1. Short Acknowledgements / Confirmation:
@@ -1038,6 +1141,7 @@ STRICT BEHAVIOR AND FLEXIBILITY RULES:
    - When the user asks "can you help me with [topic]" or makes a request, analyze whether it is in your domain of assistance (writing, emails, templates, translations, productivity, general helpful information, coding, etc. - basically anything that is safe and helpful).
    - If it is in your domain, you MUST start your response with: "Yes, I can help you do that!" (or French equivalent: "Oui, je peux tout à fait vous aider à faire cela !") followed by the detailed solution/response.
    - If the request is completely outside your capabilities or unsafe (such as hacking, malware, illegal activities, physical harm, etc.), you MUST respond with: "Sorry, I am not designed to reply to this kind of request." (or French equivalent: "Désolé, je ne suis pas conçu pour répondre à ce type de demande.").
+${inboxSection}
 
 DRAFTING & COMMUNICATION RULES:
 - Match the language of the user (French or English).
@@ -1057,10 +1161,10 @@ DRAFTING & COMMUNICATION RULES:
       },
     });
 
-    res.json({ reply: response.text || fallbackChat(messages) });
+    res.json({ reply: response.text || fallbackChat(messages, inboxContext) });
   } catch (error: any) {
     console.log("[AI] Chat endpoint: Using local fallback assistant chatbot.");
-    res.json({ reply: fallbackChat(messages) });
+    res.json({ reply: fallbackChat(messages, inboxContext) });
   }
 });
 
