@@ -19,6 +19,34 @@ const PORT = 3000;
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 app.use(express.json({ limit: "10mb" }));
+
+// --- CORS ---------------------------------------------------------------
+// The Chrome extension's background service worker calls these endpoints
+// (/api/triage, /api/summary) directly from a "chrome-extension://…"
+// origin. Without any CORS headers here, the browser's preflight (OPTIONS)
+// check fails with "blocked by CORS policy" and the request never reaches
+// these routes at all — which is exactly what silently broke classification
+// for newly-arrived mail (only mail already cached client-side from before
+// this bug still showed a label/badge). Reflecting the request's own
+// Origin header is safe here since this is a local dev server with no
+// cookie-based auth on the AI endpoints themselves (session cookies are
+// only checked by the /api/gmail/* routes, which the extension doesn't
+// call — it talks to the Gmail API directly with its own OAuth token).
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  }
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+// -------------------------------------------------------------------------
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "mailcraft-dev-secret-change-me",
@@ -66,7 +94,11 @@ app.get("/api/auth/google", (req, res) => {
 app.get("/api/auth/google/callback", async (req, res) => {
   const code = req.query.code as string;
   if (!code) {
-    return res.redirect("/?auth_error=missing_code");
+    // /app (Dashboard) is what actually reads auth_success/auth_error —
+    // Landing ("/") never looks at these params at all, which is why
+    // redirecting there made a successful login look like it silently
+    // failed / "did nothing".
+    return res.redirect("/app?auth_error=missing_code");
   }
 
   try {
@@ -76,11 +108,11 @@ app.get("/api/auth/google/callback", async (req, res) => {
       refresh_token: tokens.refresh_token,
       expiry_date: tokens.expiry_date,
     };
-    // Redirect back to the frontend app, logged in
-    res.redirect("/?auth_success=true");
+    // Redirect back to the actual app/dashboard route, logged in.
+    res.redirect("/app?auth_success=true");
   } catch (error) {
     console.error("OAuth callback error:", error);
-    res.redirect("/?auth_error=token_exchange_failed");
+    res.redirect("/app?auth_error=token_exchange_failed");
   }
 });
 
@@ -262,6 +294,74 @@ app.post("/api/gmail/apply-label", async (req, res) => {
       tag,
     });
     res.status(500).json({ error: "Failed to apply label" });
+  }
+});
+
+// 5c. One-shot migration: move every message off the old "MailCraft/<tag>"
+// labels (created before labels were renamed to plain tag names) onto the
+// new plain-named label, then delete the now-empty old label. Safe to
+// call more than once — labels already migrated just won't be found again.
+app.post("/api/gmail/migrate-labels", async (req, res) => {
+  const gmail = getGmailClient(req);
+  if (!gmail) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  try {
+    const accessToken = req.session.tokens?.access_token || "";
+    const list = await gmail.users.labels.list({ userId: "me" });
+    const oldLabels = (list.data.labels || []).filter((l) =>
+      l.name?.startsWith("MailCraft/")
+    );
+
+    const migrated: { from: string; to: string; messageCount: number }[] = [];
+
+    for (const oldLabel of oldLabels) {
+      if (!oldLabel.id || !oldLabel.name) continue;
+      const tag = oldLabel.name.slice("MailCraft/".length);
+      const newLabelId = await getOrCreateLabelId(gmail, accessToken, tag);
+
+      // Gather every message under the old label (paginated).
+      const messageIds: string[] = [];
+      let pageToken: string | undefined;
+      do {
+        const msgList = await gmail.users.messages.list({
+          userId: "me",
+          labelIds: [oldLabel.id],
+          maxResults: 500,
+          pageToken,
+        });
+        (msgList.data.messages || []).forEach((m) => m.id && messageIds.push(m.id));
+        pageToken = msgList.data.nextPageToken || undefined;
+      } while (pageToken);
+
+      // batchModify handles up to 1000 ids per call — chunk defensively.
+      for (let i = 0; i < messageIds.length; i += 900) {
+        const chunk = messageIds.slice(i, i + 900);
+        if (chunk.length === 0) continue;
+        await gmail.users.messages.batchModify({
+          userId: "me",
+          requestBody: {
+            ids: chunk,
+            addLabelIds: [newLabelId],
+            removeLabelIds: [oldLabel.id],
+          },
+        });
+      }
+
+      // Now empty — remove the old label itself so it disappears from the sidebar.
+      await gmail.users.labels.delete({ userId: "me", id: oldLabel.id });
+
+      migrated.push({ from: oldLabel.name, to: tag, messageCount: messageIds.length });
+    }
+
+    res.json({ success: true, migrated });
+  } catch (error: any) {
+    console.error("Gmail label migration error:", {
+      message: error?.message,
+      status: error?.status ?? error?.response?.status,
+    });
+    res.status(500).json({ error: "Failed to migrate labels" });
   }
 });
 

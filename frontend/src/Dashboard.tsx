@@ -331,6 +331,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
       return false;
     }
   });
+  const [migratingLabels, setMigratingLabels] = useState<boolean>(false);
   const [showMatchingOverlay, setShowMatchingOverlay] = useState<boolean>(false);
   
   // Persistent Notifications
@@ -2653,6 +2654,47 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                       <p className="text-[10px] text-slate-500 italic">
                         Ce réglage s'applique uniquement aux prochains emails classés — il ne modifie pas rétroactivement les libellés déjà posés.
                       </p>
+                    </div>
+
+                    {/* One-shot migration of old MailCraft/<tag> labels */}
+                    <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col gap-3">
+                      <span className="text-[10px] uppercase font-extrabold text-amber-400 tracking-wider">Migrer les anciens libellés</span>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Déplace tous les emails des anciens libellés <code className="bg-slate-800 px-1 rounded text-indigo-300">MailCraft/Job</code>, <code className="bg-slate-800 px-1 rounded text-indigo-300">MailCraft/Meeting</code>... vers les nouveaux libellés simples (<code className="bg-slate-800 px-1 rounded text-indigo-300">Job</code>, <code className="bg-slate-800 px-1 rounded text-indigo-300">Meeting</code>), puis supprime les anciens. Sans danger de relancer plusieurs fois.
+                      </p>
+                      <button
+                        disabled={migratingLabels}
+                        onClick={async () => {
+                          setMigratingLabels(true);
+                          try {
+                            const res = await fetch("/api/gmail/migrate-labels", { method: "POST" });
+                            const data = await res.json();
+                            if (res.ok && data.success) {
+                              const count = data.migrated?.length || 0;
+                              showToast(
+                                count > 0
+                                  ? `${count} libellé(s) migré(s) avec succès !`
+                                  : "Aucun ancien libellé MailCraft/... trouvé."
+                              );
+                            } else {
+                              showToast("Échec de la migration des libellés.");
+                            }
+                          } catch (err) {
+                            showToast("Impossible de contacter le serveur pour la migration.");
+                          } finally {
+                            setMigratingLabels(false);
+                          }
+                        }}
+                        className="bg-amber-600/90 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-[11px] px-4 py-2.5 rounded-xl transition-all flex items-center justify-center gap-2 w-fit"
+                      >
+                        {migratingLabels ? (
+                          <>
+                            <RefreshCw size={12} className="animate-spin" /> Migration en cours...
+                          </>
+                        ) : (
+                          <>Lancer la migration</>
+                        )}
+                      </button>
                     </div>
 
                     {/* Simulation Triggers */}
