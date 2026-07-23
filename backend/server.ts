@@ -172,13 +172,12 @@ app.get("/api/gmail/inbox", async (req, res) => {
 });
 
 // Helper: find (or create) a Gmail label for a given classification tag.
-// Labels are namespaced under "MailCraft/<tag>" (Gmail renders the "/" as a
-// nested label in the sidebar) so we never collide with the user's own
-// existing labels, and so all auto-created labels are grouped together.
-// A tiny in-memory cache avoids re-listing labels on every single email
-// during a triage batch — it's keyed per Gmail client instance's access
-// token so it can't leak across different logged-in users on the same
-// server process.
+// Labels are named EXACTLY like the classification tag (e.g. "Job",
+// "Meeting", "Interview") — no prefix — so they read the same as the tag
+// shown in the app/extension badges. A tiny in-memory cache avoids
+// re-listing labels on every single email during a triage batch — it's
+// keyed per Gmail client instance's access token so it can't leak across
+// different logged-in users on the same server process.
 const labelIdCache = new Map<string, string>(); // key: `${accessToken}:${labelName}` -> labelId
 
 function sanitizeLabelName(tag: string): string {
@@ -193,7 +192,7 @@ async function getOrCreateLabelId(
   accessToken: string,
   tag: string
 ): Promise<string> {
-  const labelName = `${sanitizeLabelName(tag)}`;
+  const labelName = sanitizeLabelName(tag);
   const cacheKey = `${accessToken}:${labelName}`;
   const cached = labelIdCache.get(cacheKey);
   if (cached) return cached;
@@ -254,7 +253,7 @@ app.post("/api/gmail/apply-label", async (req, res) => {
       },
     });
 
-    res.json({ success: true, labelId, labelName: `${sanitizeLabelName(tag)}` });
+    res.json({ success: true, labelId, labelName: sanitizeLabelName(tag) });
   } catch (error: any) {
     console.error("Gmail apply-label error:", {
       message: error?.message,

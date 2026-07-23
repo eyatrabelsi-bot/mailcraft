@@ -53,7 +53,8 @@ function persistCache() {
 }
 // ---------------------------------------------------------------------------
 
-// --- Full-body fetch via the extension's OWN Gmail OAuth token -----------
+// --- Full-body fetch + real label management via the extension's OWN Gmail
+// OAuth token -----------------------------------------------------------
 // We deliberately do NOT reuse the web app's backend session (server.ts's
 // express-session cookie is SameSite: Lax, and a background-worker fetch
 // to a different origin is cross-site, so the cookie wouldn't be sent
@@ -61,7 +62,10 @@ function persistCache() {
 // its own token via chrome.identity and talks to the Gmail API directly.
 // This requires:
 //   1. manifest.json: "identity" permission + an "oauth2" block with a
-//      client_id and the gmail.readonly scope
+//      client_id and the gmail.modify scope (readonly alone is NOT enough —
+//      creating/applying labels needs write access, which is why new mail
+//      classified live in Gmail was showing a badge but never actually
+//      getting a real libellé before this scope was added).
 //   2. manifest.json: host_permissions including
 //      "https://gmail.googleapis.com/*"
 // See the manifest.json diff alongside this file.
@@ -111,6 +115,145 @@ async function fetchFullBody(threadId) {
   return extractPlainTextBody(latest?.payload) || "";
 }
 
+// --- Real Gmail label creation + assignment --------------------------------
+// This is the part that was MISSING before: content.js/background.js could
+// classify a row and show a colored badge, but nothing ever touched the
+// user's actual Gmail labels for mail encountered this way (only mail
+// fetched through the separate web app's own /api/gmail/inbox polling got
+// a real label, via the backend's /api/gmail/apply-label). Newly-arrived
+// mail — seen live in the Gmail tab, never pulled through that other path —
+// was classified (badge shown) but never actually filed under a libellé.
+//
+// Labels are named EXACTLY as the classification tag (e.g. "Job",
+// "Meeting", "Interview") — no "MailCraft/" prefix — per requirements.
+// Set to true to also remove the thread from INBOX once labeled (a real
+// "move" instead of just tagging it while it stays in the inbox).
+const ARCHIVE_AFTER_LABEL = false;
+
+// Gmail label ids rarely change once created, so this cache is persisted
+// the same way the classification cache is: chrome.storage.local survives
+// service-worker restarts, backed by an in-memory Map for the same tick.
+const LABEL_ID_STORAGE_KEY = "mailcraft_label_id_cache";
+const labelIdCache = new Map(); // tag (lowercased) -> Gmail labelId
+let labelCacheLoaded = false;
+let labelCacheLoadPromise = null;
+
+function loadLabelCacheFromStorage() {
+  if (labelCacheLoadPromise) return labelCacheLoadPromise;
+  labelCacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([LABEL_ID_STORAGE_KEY], (result) => {
+      const stored = result[LABEL_ID_STORAGE_KEY] || {};
+      for (const [tag, labelId] of Object.entries(stored)) {
+        labelIdCache.set(tag, labelId);
+      }
+      labelCacheLoaded = true;
+      resolve();
+    });
+  });
+  return labelCacheLoadPromise;
+}
+
+function persistLabelCache() {
+  chrome.storage.local.set({ [LABEL_ID_STORAGE_KEY]: Object.fromEntries(labelIdCache) });
+}
+
+function sanitizeLabelName(tag) {
+  const clean = (tag || "").trim().replace(/[\r\n]+/g, " ").slice(0, 40);
+  return clean || "Email";
+}
+
+async function getOrCreateLabelId(token, tag) {
+  if (!labelCacheLoaded) await loadLabelCacheFromStorage();
+
+  const labelName = sanitizeLabelName(tag);
+  const cacheKey = labelName.toLowerCase();
+  const cached = labelIdCache.get(cacheKey);
+  if (cached) return cached;
+
+  const listRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/labels", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!listRes.ok) throw new Error(`Gmail labels.list returned ${listRes.status}`);
+  const listData = await listRes.json();
+  const existing = (listData.labels || []).find(
+    (l) => (l.name || "").toLowerCase() === labelName.toLowerCase()
+  );
+  if (existing?.id) {
+    labelIdCache.set(cacheKey, existing.id);
+    persistLabelCache();
+    return existing.id;
+  }
+
+  const createRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/labels", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: labelName,
+      labelListVisibility: "labelShow",
+      messageListVisibility: "show",
+    }),
+  });
+  if (!createRes.ok) throw new Error(`Gmail labels.create returned ${createRes.status}`);
+  const created = await createRes.json();
+  labelIdCache.set(cacheKey, created.id);
+  persistLabelCache();
+  return created.id;
+}
+
+// Tracks which threads already got their label applied, so a cached
+// classification hit (see below) doesn't re-call the Gmail API every time
+// the same row is re-scanned.
+const LABELED_STORAGE_KEY = "mailcraft_labeled_threads";
+const labeledThreadIds = new Set();
+let labeledCacheLoaded = false;
+let labeledCacheLoadPromise = null;
+
+function loadLabeledCacheFromStorage() {
+  if (labeledCacheLoadPromise) return labeledCacheLoadPromise;
+  labeledCacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([LABELED_STORAGE_KEY], (result) => {
+      (result[LABELED_STORAGE_KEY] || []).forEach((id) => labeledThreadIds.add(id));
+      labeledCacheLoaded = true;
+      resolve();
+    });
+  });
+  return labeledCacheLoadPromise;
+}
+
+function persistLabeledCache() {
+  // Bound growth the same way the other caches do.
+  const MAX = 2000;
+  const arr = Array.from(labeledThreadIds);
+  const trimmed = arr.length > MAX ? arr.slice(arr.length - MAX) : arr;
+  chrome.storage.local.set({ [LABELED_STORAGE_KEY]: trimmed });
+}
+
+async function ensureThreadLabeled(threadId, tag) {
+  if (!labeledCacheLoaded) await loadLabeledCacheFromStorage();
+  const dedupeKey = `${threadId}:${tag}`;
+  if (labeledThreadIds.has(dedupeKey)) return;
+
+  const token = await getAuthToken();
+  const labelId = await getOrCreateLabelId(token, tag);
+
+  const modifyRes = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/modify`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        addLabelIds: [labelId],
+        removeLabelIds: ARCHIVE_AFTER_LABEL ? ["INBOX"] : [],
+      }),
+    }
+  );
+  if (!modifyRes.ok) throw new Error(`Gmail threads.modify returned ${modifyRes.status}`);
+
+  labeledThreadIds.add(dedupeKey);
+  persistLabeledCache();
+}
+// ---------------------------------------------------------------------------
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== "CLASSIFY_EMAIL") return false;
 
@@ -122,7 +265,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!cacheLoaded) await loadCacheFromStorage();
 
     if (classificationCache.has(threadId)) {
-      sendResponse({ ok: true, result: classificationCache.get(threadId) });
+      const cachedResult = classificationCache.get(threadId);
+      sendResponse({ ok: true, result: cachedResult });
+      // Fire-and-forget: apply the real Gmail label too, in case a prior
+      // run classified this thread but failed to label it (e.g. before the
+      // gmail.modify permission was granted, or a transient API error).
+      ensureThreadLabeled(threadId, cachedResult.tag).catch((err) => {
+        console.warn("[MailCraft] Could not apply Gmail label:", err.message);
+      });
       return;
     }
 
@@ -152,6 +302,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       classificationCache.set(threadId, data);
       persistCache();
       sendResponse({ ok: true, result: data });
+
+      // Now that we have a tag, create/apply the matching real Gmail
+      // label. Kept out of the try/catch above so a labeling failure
+      // (e.g. permission not yet granted) never blocks the badge from
+      // showing — the classification itself already succeeded.
+      ensureThreadLabeled(threadId, data.tag).catch((err) => {
+        console.warn("[MailCraft] Could not apply Gmail label:", err.message);
+      });
     } catch (err) {
       sendResponse({ ok: false, error: err.message });
     }

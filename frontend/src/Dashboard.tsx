@@ -2622,7 +2622,7 @@ export default function Dashboard({ startWithSidebarOpen = true , hideInboxPrevi
                         <div className="flex gap-2 items-start">
                           <Check size={14} className="text-emerald-400 shrink-0 mt-0.5" />
                           <p>
-                            <strong className="text-white">Libellés Gmail automatiques :</strong> Pour chaque email réel connecté à votre compte Gmail, MailCraft crée (si besoin) un libellé <code className="bg-slate-800 px-1 rounded text-indigo-300">MailCraft/{"<catégorie>"}</code> correspondant à sa classification et le lui applique directement dans Gmail.
+                            <strong className="text-white">Libellés Gmail automatiques :</strong> Pour chaque email réel connecté à votre compte Gmail, MailCraft crée (si besoin) un libellé Gmail portant le nom exact de sa classification (ex. <code className="bg-slate-800 px-1 rounded text-indigo-300">Job</code>, <code className="bg-slate-800 px-1 rounded text-indigo-300">Meeting</code>) et le lui applique directement.
                           </p>
                         </div>
                       </div>
