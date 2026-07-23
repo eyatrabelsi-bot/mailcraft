@@ -915,6 +915,99 @@ app.post("/api/triage", async (req, res) => {
   }
 });
 
+// 1b. Date/Event Extraction Endpoint
+// Given an email body (and the reference date it arrived/was read on, so
+// relative phrases like "demain", "vendredi prochain", "in 3 days" resolve
+// against the right day), decide whether it mentions a concrete
+// appointment/deadline/meeting and, if so, extract it in a shape the
+// extension can hand straight to the Google Calendar API.
+app.post("/api/extract-date", async (req, res) => {
+  const { body, referenceDate } = req.body as { body?: string; referenceDate?: string };
+  if (!body) {
+    return res.status(400).json({ error: "Email body is required" });
+  }
+  const reference = referenceDate || new Date().toISOString();
+
+  try {
+    if (!apiKey) {
+      throw new Error("API Key is missing. Triggering fallback.");
+    }
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: `Reference date/time (when this email is being read): ${reference}\n\nEmail content:\n"${body}"`,
+      config: {
+        systemInstruction:
+          "You detect whether an email refers to a single concrete, schedulable event: a meeting, appointment, interview, deadline, reservation, or similar — something a person would want on their calendar. " +
+          "Ignore vague, past, or non-actionable dates (e.g. an email merely mentioning 'since 2019', a newsletter date, a past event already over). " +
+          "Only set hasEvent to true when you are reasonably confident a specific date (and, if given, time) is intended as something to attend or meet a deadline for. " +
+          "Resolve relative dates ('tomorrow', 'next Friday', 'in 3 days') against the provided reference date. " +
+          "Write the title in the same language as the email, kept short (max ~60 chars), e.g. 'Entretien avec Acme Corp' or 'Deadline: rapport trimestriel'.",
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            hasEvent: {
+              type: Type.BOOLEAN,
+              description: "True only if a specific, schedulable date was found",
+            },
+            allDay: {
+              type: Type.BOOLEAN,
+              description: "True if no specific time was given (a date-only deadline/event)",
+            },
+            startDate: {
+              type: Type.STRING,
+              description: "ISO date (YYYY-MM-DD) used only when allDay is true",
+            },
+            startDateTime: {
+              type: Type.STRING,
+              description: "ISO 8601 datetime (e.g. 2026-07-25T14:00:00) used only when allDay is false",
+            },
+            endDateTime: {
+              type: Type.STRING,
+              description: "ISO 8601 datetime for the end, only if the email explicitly gives an end/duration. Empty string otherwise.",
+            },
+            title: {
+              type: Type.STRING,
+              description: "Short calendar event title",
+            },
+            sourceNote: {
+              type: Type.STRING,
+              description: "One short sentence noting this event was auto-created by MailCraft from an email, in the email's language",
+            },
+          },
+          required: ["hasEvent", "allDay", "title"],
+        },
+      },
+    });
+
+    const resultText = response.text || '{"hasEvent":false}';
+    const extraction = JSON.parse(resultText);
+
+    // Guard against a model returning hasEvent:true without the date field
+    // that shape actually needs — treat that as "no usable event" rather
+    // than letting a malformed payload reach the Calendar API.
+    if (extraction.hasEvent) {
+      const missingDate = extraction.allDay ? !extraction.startDate : !extraction.startDateTime;
+      if (missingDate || !extraction.title) {
+        return res.json({ hasEvent: false });
+      }
+    }
+
+    res.json(extraction);
+  } catch (error: any) {
+    console.error("[AI] Extract-date endpoint error:", {
+      message: error?.message,
+      status: error?.status ?? error?.response?.status,
+      code: error?.code,
+    });
+    // No safe regex fallback for this one — misfiring here creates a real
+    // event on the user's calendar, so on any failure we simply skip it
+    // rather than guessing.
+    console.log("[AI] Extract-date endpoint: skipping (no fallback) due to error.");
+    res.json({ hasEvent: false });
+  }
+});
+
 // 2. Summary Endpoint
 // Server-side summary cache, keyed by a hash of the NORMALIZED body text.
 // The extension (content.js, in real gmail.com) and the app (App.tsx) each

@@ -254,6 +254,113 @@ async function ensureThreadLabeled(threadId, tag) {
 }
 // ---------------------------------------------------------------------------
 
+// --- Auto-create Google Calendar event when an email mentions a date -------
+// Same rationale as the label cache above: the backend (/api/extract-date)
+// does the actual date understanding (including resolving relative dates
+// like "demain" / "vendredi prochain" against the email's own date), and
+// this service worker uses its own Gmail/Calendar OAuth token (now scoped
+// with calendar.events, see manifest.json) to write directly to the user's
+// primary Google Calendar — no separate "connect calendar" step needed.
+const EXTRACT_DATE_URL = "http://localhost:3000/api/extract-date";
+const CALENDAR_EVENT_STORAGE_KEY = "mailcraft_calendar_event_cache";
+const calendarEventThreadIds = new Set(); // dedupe: never create 2 events for the same thread
+let calendarCacheLoaded = false;
+let calendarCacheLoadPromise = null;
+
+function loadCalendarCacheFromStorage() {
+  if (calendarCacheLoadPromise) return calendarCacheLoadPromise;
+  calendarCacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([CALENDAR_EVENT_STORAGE_KEY], (result) => {
+      (result[CALENDAR_EVENT_STORAGE_KEY] || []).forEach((id) => calendarEventThreadIds.add(id));
+      calendarCacheLoaded = true;
+      resolve();
+    });
+  });
+  return calendarCacheLoadPromise;
+}
+
+function persistCalendarCache() {
+  const MAX = 2000;
+  const arr = Array.from(calendarEventThreadIds);
+  const trimmed = arr.length > MAX ? arr.slice(arr.length - MAX) : arr;
+  chrome.storage.local.set({ [CALENDAR_EVENT_STORAGE_KEY]: trimmed });
+}
+
+// Builds a Calendar API events.insert body from what /api/extract-date
+// returned. All-day events use exclusive end dates (Calendar API
+// requirement), timed events default to a 1-hour duration when the email
+// didn't specify one.
+function buildCalendarEventBody(extraction) {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+  if (extraction.allDay) {
+    const start = new Date(`${extraction.startDate}T00:00:00`);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1); // Calendar wants an exclusive end date
+    const toDateStr = (d) => d.toISOString().slice(0, 10);
+    return {
+      summary: extraction.title,
+      description: extraction.sourceNote || "",
+      start: { date: extraction.startDate },
+      end: { date: toDateStr(end) },
+    };
+  }
+
+  const start = new Date(extraction.startDateTime);
+  const end = extraction.endDateTime
+    ? new Date(extraction.endDateTime)
+    : new Date(start.getTime() + 60 * 60 * 1000); // default 1h duration
+
+  return {
+    summary: extraction.title,
+    description: extraction.sourceNote || "",
+    start: { dateTime: start.toISOString(), timeZone },
+    end: { dateTime: end.toISOString(), timeZone },
+  };
+}
+
+async function createCalendarEvent(eventBody) {
+  const token = await getAuthToken();
+  const res = await fetch(
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(eventBody),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Calendar events.insert returned ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+async function ensureCalendarEventFromEmail(threadId, body) {
+  if (!calendarCacheLoaded) await loadCalendarCacheFromStorage();
+  if (calendarEventThreadIds.has(threadId)) return; // already handled this thread
+
+  const res = await fetch(EXTRACT_DATE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body, referenceDate: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`Backend /api/extract-date returned ${res.status}`);
+  const extraction = await res.json();
+
+  // Mark as handled regardless of outcome so we don't re-query the backend
+  // for this thread on every future classification (e.g. re-triggered by
+  // Gmail re-rendering the row).
+  calendarEventThreadIds.add(threadId);
+  persistCalendarCache();
+
+  if (!extraction?.hasEvent) return;
+
+  const eventBody = buildCalendarEventBody(extraction);
+  await createCalendarEvent(eventBody);
+}
+// ---------------------------------------------------------------------------
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== "CLASSIFY_EMAIL") return false;
 
@@ -272,6 +379,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // gmail.modify permission was granted, or a transient API error).
       ensureThreadLabeled(threadId, cachedResult.tag).catch((err) => {
         console.warn("[MailCraft] Could not apply Gmail label:", err.message);
+      });
+      ensureCalendarEventFromEmail(threadId, snippetBody).catch((err) => {
+        console.warn("[MailCraft] Could not create calendar event:", err.message);
       });
       return;
     }
@@ -309,6 +419,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // showing — the classification itself already succeeded.
       ensureThreadLabeled(threadId, data.tag).catch((err) => {
         console.warn("[MailCraft] Could not apply Gmail label:", err.message);
+      });
+      // `body` here is whichever text we actually had (full fetched body if
+      // available, otherwise the subject+snippet from content.js) — reuse
+      // it rather than re-fetching, same as the triage call above did.
+      ensureCalendarEventFromEmail(threadId, body).catch((err) => {
+        console.warn("[MailCraft] Could not create calendar event:", err.message);
       });
     } catch (err) {
       sendResponse({ ok: false, error: err.message });
