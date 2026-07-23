@@ -863,11 +863,19 @@ Dans l'attente de votre retour, je vous prie d'agréer, Madame, Monsieur, l'expr
 // ================= ENDPOINTS =================
 
 // 1. Classification (Triage) Endpoint
+// Also extracts a schedulable date/event (meeting, deadline, appointment)
+// in the SAME Gemini call as the urgency/tag classification. This used to
+// be a separate /api/extract-date call, but that doubled the number of AI
+// requests per email (1 -> 2), which is enough to blow through the Gemini
+// free-tier per-minute quota on its own — silently disabling BOTH features
+// via 429s once the limit is hit. One combined call keeps the request
+// count exactly what it was before the calendar feature was added.
 app.post("/api/triage", async (req, res) => {
-  const { body } = req.body;
+  const { body, referenceDate } = req.body as { body?: string; referenceDate?: string };
   if (!body) {
     return res.status(400).json({ error: "Email body is required" });
   }
+  const reference = referenceDate || new Date().toISOString();
 
   try {
     if (!apiKey) {
@@ -875,9 +883,15 @@ app.post("/api/triage", async (req, res) => {
     }
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
-      contents: `Classify the following email body:\n\n"${body}"`,
+      contents: `Reference date/time (when this email is being read): ${reference}\n\nClassify and analyze the following email body:\n\n"${body}"`,
       config: {
-        systemInstruction: "You are a professional email classifier. You must categorize emails according to urgency and core topic.",
+        systemInstruction:
+          "You are a professional email classifier. You must categorize emails according to urgency and core topic. " +
+          "You must ALSO detect whether the email refers to a single concrete, schedulable event: a meeting, appointment, interview, deadline, reservation, or similar — something a person would want on their calendar. " +
+          "Ignore vague, past, or non-actionable dates (e.g. an email merely mentioning 'since 2019', a newsletter date, a past event already over). " +
+          "Only set hasEvent to true when you are reasonably confident a specific date (and, if given, time) is intended as something to attend or meet a deadline for. " +
+          "Resolve relative dates ('tomorrow', 'next Friday', 'in 3 days') against the provided reference date. " +
+          "Write the event title in the same language as the email, kept short (max ~60 chars), e.g. 'Entretien avec Acme Corp' or 'Deadline: rapport trimestriel'.",
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -890,14 +904,55 @@ app.post("/api/triage", async (req, res) => {
               type: Type.STRING,
               description: "A single word summarizing the topic, such as: 'Job', 'Study', 'Meeting', 'Stage', or another single relevant word.",
             },
+            hasEvent: {
+              type: Type.BOOLEAN,
+              description: "True only if a specific, schedulable date was found",
+            },
+            allDay: {
+              type: Type.BOOLEAN,
+              description: "True if no specific time was given (a date-only deadline/event)",
+            },
+            startDate: {
+              type: Type.STRING,
+              description: "ISO date (YYYY-MM-DD) used only when allDay is true",
+            },
+            startDateTime: {
+              type: Type.STRING,
+              description: "ISO 8601 datetime (e.g. 2026-07-25T14:00:00) used only when allDay is false",
+            },
+            endDateTime: {
+              type: Type.STRING,
+              description: "ISO 8601 datetime for the end, only if the email explicitly gives an end/duration. Empty string otherwise.",
+            },
+            eventTitle: {
+              type: Type.STRING,
+              description: "Short calendar event title, empty string if hasEvent is false",
+            },
+            sourceNote: {
+              type: Type.STRING,
+              description: "One short sentence noting this event was auto-created by MailCraft from an email, in the email's language. Empty string if hasEvent is false.",
+            },
           },
-          required: ["urgency", "tag"],
+          required: ["urgency", "tag", "hasEvent", "allDay"],
         },
       },
     });
 
     const resultText = response.text || "{}";
     const classification = JSON.parse(resultText);
+
+    // Guard against a model returning hasEvent:true without the date field
+    // that shape actually needs — treat that as "no usable event" rather
+    // than letting a malformed payload reach the Calendar API downstream.
+    if (classification.hasEvent) {
+      const missingDate = classification.allDay
+        ? !classification.startDate
+        : !classification.startDateTime;
+      if (missingDate || !classification.eventTitle) {
+        classification.hasEvent = false;
+      }
+    }
+
     res.json(classification);
   } catch (error: any) {
     // Log the REAL failure reason — status code, message, whatever the SDK
@@ -911,16 +966,17 @@ app.post("/api/triage", async (req, res) => {
     });
     console.log("[AI] Triage endpoint: Using local fallback classification.");
     const result = fallbackTriage(body);
-    res.json(result);
+    // Fallback never guesses at dates (see /api/extract-date's rationale
+    // below) — a missed event is far better than a wrong one.
+    res.json({ ...result, hasEvent: false });
   }
 });
 
-// 1b. Date/Event Extraction Endpoint
-// Given an email body (and the reference date it arrived/was read on, so
-// relative phrases like "demain", "vendredi prochain", "in 3 days" resolve
-// against the right day), decide whether it mentions a concrete
-// appointment/deadline/meeting and, if so, extract it in a shape the
-// extension can hand straight to the Google Calendar API.
+// 1b. Date/Event Extraction Endpoint (standalone)
+// Kept as a separate route for callers that only need date extraction
+// (e.g. a future "scan this email" action from the web app) without also
+// paying for a classification. The extension's live Gmail flow no longer
+// calls this — see the merged logic in /api/triage above.
 app.post("/api/extract-date", async (req, res) => {
   const { body, referenceDate } = req.body as { body?: string; referenceDate?: string };
   if (!body) {

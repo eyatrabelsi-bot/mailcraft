@@ -261,7 +261,6 @@ async function ensureThreadLabeled(threadId, tag) {
 // this service worker uses its own Gmail/Calendar OAuth token (now scoped
 // with calendar.events, see manifest.json) to write directly to the user's
 // primary Google Calendar — no separate "connect calendar" step needed.
-const EXTRACT_DATE_URL = "http://localhost:3000/api/extract-date";
 const CALENDAR_EVENT_STORAGE_KEY = "mailcraft_calendar_event_cache";
 const calendarEventThreadIds = new Set(); // dedupe: never create 2 events for the same thread
 let calendarCacheLoaded = false;
@@ -299,7 +298,7 @@ function buildCalendarEventBody(extraction) {
     end.setDate(end.getDate() + 1); // Calendar wants an exclusive end date
     const toDateStr = (d) => d.toISOString().slice(0, 10);
     return {
-      summary: extraction.title,
+      summary: extraction.eventTitle,
       description: extraction.sourceNote || "",
       start: { date: extraction.startDate },
       end: { date: toDateStr(end) },
@@ -312,7 +311,7 @@ function buildCalendarEventBody(extraction) {
     : new Date(start.getTime() + 60 * 60 * 1000); // default 1h duration
 
   return {
-    summary: extraction.title,
+    summary: extraction.eventTitle,
     description: extraction.sourceNote || "",
     start: { dateTime: start.toISOString(), timeZone },
     end: { dateTime: end.toISOString(), timeZone },
@@ -336,27 +335,25 @@ async function createCalendarEvent(eventBody) {
   return res.json();
 }
 
-async function ensureCalendarEventFromEmail(threadId, body) {
+// `classification` is the SAME object /api/triage already returned for
+// this email (urgency/tag PLUS the hasEvent/startDate/etc. fields) — no
+// extra network call needed. This used to hit its own /api/extract-date
+// endpoint, but that doubled Gemini API requests per email and reliably
+// blew through the free-tier per-minute quota (see the comment on
+// /api/triage in server.ts).
+async function ensureCalendarEventFromEmail(threadId, classification) {
   if (!calendarCacheLoaded) await loadCalendarCacheFromStorage();
   if (calendarEventThreadIds.has(threadId)) return; // already handled this thread
 
-  const res = await fetch(EXTRACT_DATE_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body, referenceDate: new Date().toISOString() }),
-  });
-  if (!res.ok) throw new Error(`Backend /api/extract-date returned ${res.status}`);
-  const extraction = await res.json();
-
-  // Mark as handled regardless of outcome so we don't re-query the backend
-  // for this thread on every future classification (e.g. re-triggered by
-  // Gmail re-rendering the row).
+  // Mark as handled regardless of outcome so we don't re-attempt this
+  // thread on every future classification (e.g. re-triggered by Gmail
+  // re-rendering the row).
   calendarEventThreadIds.add(threadId);
   persistCalendarCache();
 
-  if (!extraction?.hasEvent) return;
+  if (!classification?.hasEvent) return;
 
-  const eventBody = buildCalendarEventBody(extraction);
+  const eventBody = buildCalendarEventBody(classification);
   await createCalendarEvent(eventBody);
 }
 // ---------------------------------------------------------------------------
@@ -380,7 +377,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ensureThreadLabeled(threadId, cachedResult.tag).catch((err) => {
         console.warn("[MailCraft] Could not apply Gmail label:", err.message);
       });
-      ensureCalendarEventFromEmail(threadId, snippetBody).catch((err) => {
+      ensureCalendarEventFromEmail(threadId, cachedResult).catch((err) => {
         console.warn("[MailCraft] Could not create calendar event:", err.message);
       });
       return;
@@ -404,11 +401,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const res = await fetch(BACKEND_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body, referenceDate: new Date().toISOString() }),
       });
       if (!res.ok) throw new Error(`Backend returned ${res.status}`);
       const data = await res.json();
-      // Real shape from /api/triage: { urgency, tag }
+      // Real shape from /api/triage: { urgency, tag, hasEvent, allDay,
+      // startDate|startDateTime, endDateTime, eventTitle, sourceNote }
       classificationCache.set(threadId, data);
       persistCache();
       sendResponse({ ok: true, result: data });
@@ -420,10 +418,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ensureThreadLabeled(threadId, data.tag).catch((err) => {
         console.warn("[MailCraft] Could not apply Gmail label:", err.message);
       });
-      // `body` here is whichever text we actually had (full fetched body if
-      // available, otherwise the subject+snippet from content.js) — reuse
-      // it rather than re-fetching, same as the triage call above did.
-      ensureCalendarEventFromEmail(threadId, body).catch((err) => {
+      ensureCalendarEventFromEmail(threadId, data).catch((err) => {
         console.warn("[MailCraft] Could not create calendar event:", err.message);
       });
     } catch (err) {
