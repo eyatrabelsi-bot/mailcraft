@@ -82,6 +82,26 @@ function getAuthToken(interactive = false) {
   });
 }
 
+// A non-interactive getAuthToken() call silently fails (no popup, just an
+// error) if the cached token doesn't yet cover a scope that was just added
+// to manifest.json (like calendar.events) — Chrome will NOT prompt the
+// user on its own here. Without this fallback, calendar event creation
+// would fail forever after every single call, with no way for the user to
+// ever grant the new permission. Falling back to an interactive request
+// opens Google's consent screen once; after that's approved, subsequent
+// non-interactive calls succeed normally and this branch is never hit again.
+async function getAuthTokenWithConsentFallback() {
+  try {
+    return await getAuthToken(false);
+  } catch (err) {
+    console.warn(
+      "[MailCraft] Silent auth failed (likely a newly-added scope not yet granted), " +
+      "requesting interactive consent:", err.message
+    );
+    return await getAuthToken(true);
+  }
+}
+
 // Same base64url decode + multi-part walk server.ts does for /api/gmail/inbox
 // (kept in sync with the extractBody logic there) — plain text, then
 // falls back to nothing if the thread is HTML-only.
@@ -100,7 +120,7 @@ function extractPlainTextBody(payload) {
 }
 
 async function fetchFullBody(threadId) {
-  const token = await getAuthToken();
+  const token = await getAuthTokenWithConsentFallback();
   const res = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}?format=full`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -233,7 +253,7 @@ async function ensureThreadLabeled(threadId, tag) {
   const dedupeKey = `${threadId}:${tag}`;
   if (labeledThreadIds.has(dedupeKey)) return;
 
-  const token = await getAuthToken();
+  const token = await getAuthTokenWithConsentFallback();
   const labelId = await getOrCreateLabelId(token, tag);
 
   const modifyRes = await fetch(
@@ -289,8 +309,41 @@ function persistCalendarCache() {
 // returned. All-day events use exclusive end dates (Calendar API
 // requirement), timed events default to a 1-hour duration when the email
 // didn't specify one.
+// Explicit reminders — without these, an inserted event uses whatever the
+// calendar's OWN default reminders are (which can be "none"), so a user
+// could get an event created but genuinely never be notified before it
+// starts. Only "Important"-classified emails get a heads-up; everything
+// else just sits quietly on the calendar as a record, with no notification
+// and the calendar's normal (non-red) color.
+const TIMED_EVENT_REMINDERS = {
+  useDefault: false,
+  overrides: [
+    { method: "popup", minutes: 30 }, // 30 min before start
+    { method: "email", minutes: 60 }, // 1h before start, as a backup channel
+  ],
+};
+// All-day/deadline events have no specific start time to count back from,
+// so instead of "minutes before", remind the evening before at a sensible
+// hour (18:00 the prior day) using a popup the morning of as well.
+const ALL_DAY_EVENT_REMINDERS = {
+  useDefault: false,
+  overrides: [
+    { method: "popup", minutes: 12 * 60 }, // ~ the evening before / morning of
+    { method: "email", minutes: 24 * 60 }, // 1 day before
+  ],
+};
+// Explicitly no reminders at all (not "use calendar default" — an actual
+// silent event) for anything not classified as Important.
+const NO_REMINDERS = { useDefault: false, overrides: [] };
+
+// Google Calendar's fixed color palette id for red ("Tomato"). See
+// https://developers.google.com/calendar/api/v3/reference/colors/get —
+// this id is stable across accounts, no need to look it up per-user.
+const IMPORTANT_EVENT_COLOR_ID = "11";
+
 function buildCalendarEventBody(extraction) {
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const isImportant = (extraction.urgency || "").toLowerCase() === "important";
 
   if (extraction.allDay) {
     const start = new Date(`${extraction.startDate}T00:00:00`);
@@ -302,6 +355,8 @@ function buildCalendarEventBody(extraction) {
       description: extraction.sourceNote || "",
       start: { date: extraction.startDate },
       end: { date: toDateStr(end) },
+      reminders: isImportant ? ALL_DAY_EVENT_REMINDERS : NO_REMINDERS,
+      ...(isImportant ? { colorId: IMPORTANT_EVENT_COLOR_ID } : {}),
     };
   }
 
@@ -315,11 +370,13 @@ function buildCalendarEventBody(extraction) {
     description: extraction.sourceNote || "",
     start: { dateTime: start.toISOString(), timeZone },
     end: { dateTime: end.toISOString(), timeZone },
+    reminders: isImportant ? TIMED_EVENT_REMINDERS : NO_REMINDERS,
+    ...(isImportant ? { colorId: IMPORTANT_EVENT_COLOR_ID } : {}),
   };
 }
 
 async function createCalendarEvent(eventBody) {
-  const token = await getAuthToken();
+  const token = await getAuthTokenWithConsentFallback();
   const res = await fetch(
     "https://www.googleapis.com/calendar/v3/calendars/primary/events",
     {
@@ -332,7 +389,9 @@ async function createCalendarEvent(eventBody) {
     const text = await res.text().catch(() => "");
     throw new Error(`Calendar events.insert returned ${res.status}: ${text}`);
   }
-  return res.json();
+  const created = await res.json();
+  console.log("[MailCraft] Calendar event created:", created.htmlLink || created.id);
+  return created;
 }
 
 // `classification` is the SAME object /api/triage already returned for
@@ -351,10 +410,173 @@ async function ensureCalendarEventFromEmail(threadId, classification) {
   calendarEventThreadIds.add(threadId);
   persistCalendarCache();
 
-  if (!classification?.hasEvent) return;
+  if (!classification?.hasEvent) {
+    console.log(`[MailCraft] No schedulable date detected for thread ${threadId}, skipping calendar.`);
+    return;
+  }
 
+  console.log(`[MailCraft] Date detected for thread ${threadId}, creating calendar event:`, classification.eventTitle);
   const eventBody = buildCalendarEventBody(classification);
   await createCalendarEvent(eventBody);
+  scheduleDeviceReminder(threadId, classification);
+}
+// ---------------------------------------------------------------------------
+
+// --- Native OS/device notifications before important events ---------------
+// Google Calendar's own "popup" reminder only surfaces if calendar.google.com
+// is open in a tab, or the Calendar mobile app is running — it does NOT
+// reach the OS notification tray on its own. chrome.alarms + chrome.notifications
+// fire directly from this background service worker, independent of any open
+// tab or page, as long as Chrome itself is running on the device.
+const REMINDER_MINUTES_BEFORE_TIMED = 30;
+const REMINDER_MINUTES_BEFORE_ALLDAY = 12 * 60; // ~evening before / morning of
+const ALARM_PREFIX = "mailcraft-reminder:";
+
+function scheduleDeviceReminder(threadId, extraction) {
+  // Only "Important"-classified events get a device notification — matches
+  // the same rule used for the red calendar color/reminders.
+  if ((extraction.urgency || "").toLowerCase() !== "important") return;
+
+  const eventStartMs = extraction.allDay
+    ? new Date(`${extraction.startDate}T09:00:00`).getTime()
+    : new Date(extraction.startDateTime).getTime();
+  if (!Number.isFinite(eventStartMs)) return;
+
+  const now = Date.now();
+  if (eventStartMs <= now) return; // event already started/passed, nothing to remind about
+
+  const offsetMinutes = extraction.allDay ? REMINDER_MINUTES_BEFORE_ALLDAY : REMINDER_MINUTES_BEFORE_TIMED;
+  let reminderAt = eventStartMs - offsetMinutes * 60 * 1000;
+  // Reminder threshold already passed but the event itself hasn't (e.g. we
+  // only just detected an email for a meeting in 10 minutes) -> fire almost
+  // immediately instead of not notifying at all.
+  if (reminderAt <= now) reminderAt = now + 2000;
+
+  const alarmName = `${ALARM_PREFIX}${threadId}`;
+  const timeLabel = extraction.allDay
+    ? "aujourd'hui"
+    : new Date(extraction.startDateTime).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  const payload = {
+    title: `📅 Rappel : ${extraction.eventTitle}`,
+    message: extraction.allDay
+      ? `Aujourd'hui : ${extraction.eventTitle}`
+      : `Dans ${offsetMinutes} min (${timeLabel}) : ${extraction.eventTitle}`,
+    threadUrl: `https://mail.google.com/mail/u/0/#inbox/${threadId}`,
+  };
+
+  // chrome.alarms fires even if the payload needs to survive a service
+  // worker restart in between, so the message content is persisted to
+  // storage and looked up by alarm name when it actually fires.
+  chrome.storage.local.set({ [`mailcraft_alarm_payload:${alarmName}`]: payload }, () => {
+    chrome.alarms.create(alarmName, { when: reminderAt });
+  });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm.name.startsWith(ALARM_PREFIX)) return;
+  const storageKey = `mailcraft_alarm_payload:${alarm.name}`;
+  chrome.storage.local.get([storageKey], (result) => {
+    const payload = result[storageKey];
+    chrome.storage.local.remove([storageKey]);
+    if (!payload) return;
+    chrome.notifications.create(alarm.name, {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icon128.png"),
+      title: payload.title,
+      message: payload.message,
+      priority: 2,
+      requireInteraction: true, // stays in the notification tray until the user dismisses/clicks it
+    });
+    chrome.storage.local.set({ [`mailcraft_notif_link:${alarm.name}`]: payload.threadUrl });
+  });
+});
+
+// Clicking the notification jumps straight to the source email.
+chrome.notifications.onClicked.addListener((notificationId) => {
+  const linkKey = `mailcraft_notif_link:${notificationId}`;
+  chrome.storage.local.get([linkKey], (result) => {
+    const url = result[linkKey];
+    chrome.storage.local.remove([linkKey]);
+    if (url) chrome.tabs.create({ url });
+    chrome.notifications.clear(notificationId);
+  });
+});
+// ---------------------------------------------------------------------------
+
+// --- Auto-archive + notify for aggressive/hostile emails -------------------
+// Same dedupe pattern as labels/calendar: a Set backed by chrome.storage.local
+// so a thread is only ever archived+notified once, even across service
+// worker restarts or re-classification passes.
+const AGGRESSIVE_LABEL_NAME = "⚠️ Agressif";
+const AGGRESSIVE_STORAGE_KEY = "mailcraft_aggressive_handled_cache";
+const aggressiveHandledThreadIds = new Set();
+let aggressiveCacheLoaded = false;
+let aggressiveCacheLoadPromise = null;
+
+function loadAggressiveCacheFromStorage() {
+  if (aggressiveCacheLoadPromise) return aggressiveCacheLoadPromise;
+  aggressiveCacheLoadPromise = new Promise((resolve) => {
+    chrome.storage.local.get([AGGRESSIVE_STORAGE_KEY], (result) => {
+      (result[AGGRESSIVE_STORAGE_KEY] || []).forEach((id) => aggressiveHandledThreadIds.add(id));
+      aggressiveCacheLoaded = true;
+      resolve();
+    });
+  });
+  return aggressiveCacheLoadPromise;
+}
+
+function persistAggressiveCache() {
+  const MAX = 2000;
+  const arr = Array.from(aggressiveHandledThreadIds);
+  chrome.storage.local.set({
+    [AGGRESSIVE_STORAGE_KEY]: arr.length > MAX ? arr.slice(arr.length - MAX) : arr,
+  });
+}
+
+async function ensureAggressiveEmailHandled(threadId, classification) {
+  if (!classification?.isAggressive) return;
+
+  if (!aggressiveCacheLoaded) await loadAggressiveCacheFromStorage();
+  if (aggressiveHandledThreadIds.has(threadId)) return; // already archived+notified
+
+  aggressiveHandledThreadIds.add(threadId);
+  persistAggressiveCache();
+
+  const token = await getAuthTokenWithConsentFallback();
+  const labelId = await getOrCreateLabelId(token, AGGRESSIVE_LABEL_NAME);
+
+  // Tag it AND archive it (remove from inbox) in one call — this ignores
+  // the ARCHIVE_AFTER_LABEL toggle above on purpose: normal classification
+  // archiving is opt-in, but hiding a hostile email from the inbox is the
+  // whole point of this feature regardless of that setting.
+  const modifyRes = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/modify`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ addLabelIds: [labelId], removeLabelIds: ["INBOX"] }),
+    }
+  );
+  if (!modifyRes.ok) {
+    throw new Error(`Gmail threads.modify (archive) returned ${modifyRes.status}`);
+  }
+
+  console.log(`[MailCraft] Aggressive email detected on thread ${threadId}, archived.`);
+
+  // Immediate native OS notification — unlike scheduleDeviceReminder, this
+  // fires right away (no chrome.alarms delay needed), since the point is
+  // to tell the user right now that something was just hidden from them.
+  chrome.notifications.create(`mailcraft-aggressive:${threadId}`, {
+    type: "basic",
+    iconUrl: chrome.runtime.getURL("icon128.png"),
+    title: "⚠️ Email agressif archivé automatiquement",
+    message: classification.aggressiveSummary || "Un email au ton hostile a été détecté et archivé.",
+    priority: 2,
+    requireInteraction: true,
+  });
+  chrome.storage.local.set({
+    [`mailcraft_notif_link:mailcraft-aggressive:${threadId}`]: `https://mail.google.com/mail/u/0/#inbox/${threadId}`,
+  });
 }
 // ---------------------------------------------------------------------------
 
@@ -379,6 +601,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       ensureCalendarEventFromEmail(threadId, cachedResult).catch((err) => {
         console.warn("[MailCraft] Could not create calendar event:", err.message);
+      });
+      ensureAggressiveEmailHandled(threadId, cachedResult).catch((err) => {
+        console.warn("[MailCraft] Could not archive aggressive email:", err.message);
       });
       return;
     }
@@ -406,7 +631,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!res.ok) throw new Error(`Backend returned ${res.status}`);
       const data = await res.json();
       // Real shape from /api/triage: { urgency, tag, hasEvent, allDay,
-      // startDate|startDateTime, endDateTime, eventTitle, sourceNote }
+      // startDate|startDateTime, endDateTime, eventTitle, sourceNote,
+      // isAggressive, aggressiveSummary }
       classificationCache.set(threadId, data);
       persistCache();
       sendResponse({ ok: true, result: data });
@@ -420,6 +646,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       ensureCalendarEventFromEmail(threadId, data).catch((err) => {
         console.warn("[MailCraft] Could not create calendar event:", err.message);
+      });
+      ensureAggressiveEmailHandled(threadId, data).catch((err) => {
+        console.warn("[MailCraft] Could not archive aggressive email:", err.message);
       });
     } catch (err) {
       sendResponse({ ok: false, error: err.message });

@@ -891,7 +891,10 @@ app.post("/api/triage", async (req, res) => {
           "Ignore vague, past, or non-actionable dates (e.g. an email merely mentioning 'since 2019', a newsletter date, a past event already over). " +
           "Only set hasEvent to true when you are reasonably confident a specific date (and, if given, time) is intended as something to attend or meet a deadline for. " +
           "Resolve relative dates ('tomorrow', 'next Friday', 'in 3 days') against the provided reference date. " +
-          "Write the event title in the same language as the email, kept short (max ~60 chars), e.g. 'Entretien avec Acme Corp' or 'Deadline: rapport trimestriel'.",
+          "Write the event title in the same language as the email, kept short (max ~60 chars), e.g. 'Entretien avec Acme Corp' or 'Deadline: rapport trimestriel'. " +
+          "You must ALSO detect whether the email itself is aggressive, hostile, threatening, abusive, or contains insults directed at the reader — not merely a firm, blunt, or critical professional email. " +
+          "A strict deadline, a complaint, or a negative performance review is NOT aggressive by itself; only flag isAggressive when the tone is genuinely hostile/abusive/threatening. " +
+          "When isAggressive is true, write a short neutral 2-3 sentence summary (in the email's language) of what the email says, so the reader can understand it without opening it.",
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -932,8 +935,16 @@ app.post("/api/triage", async (req, res) => {
               type: Type.STRING,
               description: "One short sentence noting this event was auto-created by MailCraft from an email, in the email's language. Empty string if hasEvent is false.",
             },
+            isAggressive: {
+              type: Type.BOOLEAN,
+              description: "True only if the email's tone is genuinely hostile, threatening, abusive, or insulting",
+            },
+            aggressiveSummary: {
+              type: Type.STRING,
+              description: "2-3 sentence neutral summary of the email's content, in the email's own language. Empty string if isAggressive is false.",
+            },
           },
-          required: ["urgency", "tag", "hasEvent", "allDay"],
+          required: ["urgency", "tag", "hasEvent", "allDay", "isAggressive"],
         },
       },
     });
@@ -952,6 +963,9 @@ app.post("/api/triage", async (req, res) => {
         classification.hasEvent = false;
       }
     }
+    if (classification.isAggressive && !classification.aggressiveSummary) {
+      classification.isAggressive = false;
+    }
 
     res.json(classification);
   } catch (error: any) {
@@ -968,7 +982,7 @@ app.post("/api/triage", async (req, res) => {
     const result = fallbackTriage(body);
     // Fallback never guesses at dates (see /api/extract-date's rationale
     // below) — a missed event is far better than a wrong one.
-    res.json({ ...result, hasEvent: false });
+    res.json({ ...result, hasEvent: false, isAggressive: false });
   }
 });
 
