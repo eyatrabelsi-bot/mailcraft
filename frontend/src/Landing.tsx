@@ -166,6 +166,17 @@ export default function Landing() {
         .lp .summary-text { font-size:12.5px; color:var(--text); font-weight:500; line-height:1.5; }
         .lp .mail-body-mini { font-size:12px; color:var(--text-faint); line-height:1.6; }
 
+        .lp .archive-card { width:100%; max-width:360px; background:var(--red-wash); border:1.5px solid rgba(239,68,68,0.4); border-radius:var(--radius); padding:16px 18px; }
+        .lp .archive-top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+        .lp .archive-label { font-size:11.5px; font-weight:800; letter-spacing:0.02em; color:var(--red); }
+        .lp .archive-stamp { display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:700; color:var(--text); background:rgba(255,255,255,0.06); border:1px solid var(--border-strong); padding:4px 10px; border-radius:20px; }
+        .lp .archive-subj { font-size:12px; font-weight:500; color:var(--text-faint); margin-bottom:10px; }
+        .lp .archive-summary { font-size:12.5px; color:var(--text); font-weight:500; line-height:1.55; background:rgba(0,0,0,0.18); border-radius:var(--radius-sm); padding:10px 12px; margin-bottom:14px; }
+        .lp .archive-os-notif { display:flex; align-items:center; gap:12px; padding-top:12px; border-top:1px solid rgba(239,68,68,0.25); }
+        .lp .os-notif-icon { width:32px; height:32px; border-radius:9px; background:var(--panel-2); border:1px solid var(--border-strong); display:flex; align-items:center; justify-content:center; font-size:15px; flex-shrink:0; }
+        .lp .os-notif-title { font-size:12px; font-weight:700; color:var(--text); }
+        .lp .os-notif-sub { font-size:11px; color:var(--text-faint); margin-top:2px; }
+
         .lp .inbox-mini { width:100%; }
         .lp .inbox-row { display:flex; align-items:center; gap:12px; padding:11px 4px; border-bottom:1px solid var(--border); font-size:13px; }
         .lp .inbox-row:last-child { border:none; }
@@ -209,6 +220,7 @@ export default function Landing() {
             <a href="#tri">Le tri</a>
             <a href="#agenda">Agenda</a>
             <a href="#reponses">Réponses</a>
+            <a href="#protection">Protection</a>
             <a href="#assistant">Assistant</a>
             <a href="#partout">Extension &amp; app</a>
           </div>
@@ -372,6 +384,31 @@ export default function Landing() {
             </div>
           </div>
 
+          <div className="feature-row" id="protection">
+            <div className="feature-text">
+              <span className="feature-index">PROTECTION CONTRE LES E-MAILS AGRESSIFS</span>
+              <h3>Les messages hostiles n'atteignent jamais votre boîte de réception</h3>
+              <p>Quand le ton d'un e-mail est agressif, menaçant ou insultant, MailCraft l'étiquette "⚠️ Agressif", l'archive automatiquement pour le retirer de votre boîte de réception, et vous envoie une notification avec un résumé neutre du message — vous savez ce qu'il contient sans jamais avoir à l'ouvrir.</p>
+            </div>
+            <div className="feature-visual">
+              <div className="archive-card">
+                <div className="archive-top">
+                  <span className="archive-label">⚠️ Agressif détecté</span>
+                  <span className="archive-stamp">Archivé ✓</span>
+                </div>
+                <div className="archive-subj">De : client.mecontent@exemple.fr</div>
+                <div className="archive-summary">Résumé IA : Le client exprime sa colère au sujet d'un retard de livraison et adopte un ton menaçant envers l'équipe support.</div>
+                <div className="archive-os-notif">
+                  <span className="os-notif-icon">🔔</span>
+                  <div>
+                    <div className="os-notif-title">Email agressif archivé automatiquement</div>
+                    <div className="os-notif-sub">Notification envoyée sur votre appareil</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="feature-row" id="assistant">
             <div className="feature-text">
               <span className="feature-index">ASSISTANT PAR PROMPTS</span>
@@ -434,4 +471,4 @@ export default function Landing() {
       </footer>
     </div>
   );
-}
+};
